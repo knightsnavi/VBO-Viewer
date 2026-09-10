@@ -61,8 +61,14 @@
   td.partial { color: var(--muted); font-style: italic; }
 
   .right { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
-  .readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(95px, 1fr)); gap: 6px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .live { display: flex; gap: 10px; align-items: stretch; }
+  .readout { flex: 1; display: grid; grid-template-columns: repeat(auto-fit, minmax(95px, 1fr)); gap: 6px;
+    align-content: start; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .gg { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; display: grid; place-items: center; }
+  .gg canvas { width: 200px; height: 200px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg button { background: #222735; color: var(--muted); border: 0; padding: 6px 10px; cursor: pointer; font: inherit; }
+  .seg button.on { background: #2b4a6b; color: var(--text); }
   .readout div { font-size: 12px; color: var(--muted); }
   .readout b { display: block; color: var(--text); font-size: 15px; font-variant-numeric: tabular-nums; }
   .toolbar { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
@@ -79,6 +85,7 @@
   <h1><span>VBO</span> Viewer</h1>
   <label class="btn">Open .vbo file<input id="file" type="file" accept=".vbo,.txt"></label>
   <button class="btn" id="sample">Load sample</button>
+  <span class="seg" id="units"><button data-u="metric">km/h</button><button data-u="imperial">mph</button></span>
   <span id="fileName">No file loaded — drop a .vbo anywhere</span>
 </header>
 <div id="drop">Drop your .vbo file</div>
@@ -257,7 +264,24 @@ function detectLaps(rows, sf) {
 }
 
 /* ---------- app state ---------- */
-const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null };
+const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric' };
+try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
+
+const U = {
+  imp: () => S.units === 'imperial',
+  spd: v => U.imp() ? v * 0.621371 : v,          spdU: () => U.imp() ? 'mph' : 'km/h',
+  dist: m => U.imp() ? m / 1609.344 : m / 1000,  distU: () => U.imp() ? 'mi' : 'km',
+  hgt: m => U.imp() ? m * 3.28084 : m,           hgtU: () => U.imp() ? 'ft' : 'm',
+};
+
+function setUnits(u) {
+  S.units = u;
+  try { localStorage.setItem('vbo.units', u); } catch (e) {}
+  document.querySelectorAll('#units button').forEach(b => b.classList.toggle('on', b.dataset.u === u));
+  if (!S.data) return;
+  buildStats(); buildLapTable(); refreshCharts(); drawLegend(); setCursor(S.cursor);
+  document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === S.sel));
+}
 
 function fmtLap(s) {
   const m = Math.floor(s / 60), r = s - m * 60;
@@ -291,13 +315,16 @@ function build(parsed, name) {
           <button class="btn" id="setGate" title="Place a start/finish gate across the track at the current cursor position">Set start/finish at cursor</button>
           <button class="btn" id="allLaps">Show whole session</button></span></h2>
         <div class="scroll"><table>
-          <thead><tr><th>Lap</th><th>Time</th><th>Δ best</th><th>Max km/h</th><th>Avg km/h</th><th>Max lat G</th></tr></thead>
+          <thead><tr><th>Lap</th><th>Time</th><th>Δ best</th><th id="thMax"></th><th id="thAvg"></th><th>Max lat G</th></tr></thead>
           <tbody id="lapBody"></tbody>
         </table></div>
       </div>
     </div>
     <div class="right">
-      <div class="readout" id="readout"></div>
+      <div class="live">
+        <div class="readout" id="readout"></div>
+        <div class="gg" title="G-G diagram: lateral G left/right, longitudinal G up (accel) / down (braking)"><canvas id="gg"></canvas></div>
+      </div>
       <div class="toolbar">
         X axis:
         <select id="xMode"><option value="time">Time</option><option value="dist">Distance</option></select>
@@ -331,9 +358,9 @@ function buildStats() {
   const best = full.length ? Math.min(...full.map(l => l.time)) : null;
   const items = [
     ['Duration', fmtClock(dur)],
-    ['Distance', (dist / 1000).toFixed(2), 'km'],
-    ['Top speed', max.toFixed(1), 'km/h'],
-    ['Avg speed', (dist / dur * 3.6).toFixed(1), 'km/h'],
+    ['Distance', U.dist(dist).toFixed(2), U.distU()],
+    ['Top speed', U.spd(max).toFixed(1), U.spdU()],
+    ['Avg speed', U.spd(dist / dur * 3.6).toFixed(1), U.spdU()],
     ['Max lateral', gyMax.toFixed(2), 'g'],
     ['Max accel', gxMax.toFixed(2), 'g'],
     ['Max braking', gxMin.toFixed(2), 'g'],
@@ -355,13 +382,9 @@ function buildMap() {
   drawGate();
   S.marker = L.circleMarker([rows[0].lat, rows[0].lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#4fc3f7', fillOpacity: 1 }).addTo(map);
   const legend = L.control({ position: 'bottomleft' });
-  legend.onAdd = () => {
-    const d = L.DomUtil.create('div', 'legend');
-    const max = Math.max(...rows.map(r => r.v));
-    d.innerHTML = `Speed<div class="bar"></div><div class="ends"><span>0</span><span>${max.toFixed(0)} km/h</span></div>`;
-    return d;
-  };
+  legend.onAdd = () => { S.legendEl = L.DomUtil.create('div', 'legend'); return S.legendEl; };
   legend.addTo(map);
+  drawLegend();
   map.on('mousemove', e => {
     if (!S.data) return;
     const p = map.latLngToLayerPoint(e.latlng);
@@ -375,6 +398,12 @@ function buildMap() {
     if (best >= 0) setCursor(best);
   });
   drawTrack();
+}
+
+function drawLegend() {
+  if (!S.legendEl) return;
+  const max = U.spd(Math.max(...S.data.rows.map(r => r.v)));
+  S.legendEl.innerHTML = `Speed<div class="bar"></div><div class="ends"><span>0</span><span>${max.toFixed(0)} ${U.spdU()}</span></div>`;
 }
 
 function drawGate() {
@@ -436,26 +465,27 @@ function mkChart(id, datasets, yTitle, extra = {}) {
       },
       plugins: { legend: { display: datasets.length > 1, labels: { color: '#8b93a7', boxWidth: 12 } }, tooltip: { enabled: false } },
       scales: {
-        x: { type: 'linear', ticks: { color: '#8b93a7', maxTicksLimit: 10, callback: v => S.xMode === 'time' ? fmtClock(v) : (v / 1000).toFixed(1) + ' km' },
+        x: { type: 'linear', ticks: { color: '#8b93a7', maxTicksLimit: 10, callback: v => S.xMode === 'time' ? fmtClock(v) : U.dist(v).toFixed(1) + ' ' + U.distU() },
              grid: { color: '#262b36' } },
-        y: { title: { display: true, text: yTitle, color: '#8b93a7' }, ticks: { color: '#8b93a7' }, grid: { color: '#262b36' }, ...extra },
+        y: { title: { display: true, text: '', color: '#8b93a7' }, ticks: { color: '#8b93a7' }, grid: { color: '#262b36' }, ...extra },
       },
     },
     plugins: [cursorPlugin],
   });
   c.$base = 0;
+  c.$yTitle = yTitle;
   return c;
 }
 
 function buildCharts() {
   S.charts.forEach(c => c.destroy());
   S.charts = [
-    mkChart('cSpeed', [{ label: 'Speed', borderColor: '#4fc3f7', data: [] }], 'km/h'),
+    mkChart('cSpeed', [{ label: 'Speed', borderColor: '#4fc3f7', data: [] }], () => U.spdU()),
     mkChart('cG', [
       { label: 'Lateral G', borderColor: '#ffb74d', data: [] },
       { label: 'Longitudinal G', borderColor: '#66e0a3', data: [] },
-    ], 'g'),
-    mkChart('cAlt', [{ label: 'Height', borderColor: '#b17cff', data: [] }], 'm'),
+    ], () => 'g'),
+    mkChart('cAlt', [{ label: 'Height', borderColor: '#b17cff', data: [] }], () => U.hgtU()),
   ];
   refreshCharts();
 }
@@ -466,17 +496,19 @@ function refreshCharts() {
   const X = r => (S.xMode === 'time' ? r.t : r.d) - x0;
   const seg = rows.slice(a, b + 1);
   const [cs, cg, ca] = S.charts;
-  cs.data.datasets[0].data = seg.map(r => ({ x: X(r), y: r.v }));
+  cs.data.datasets[0].data = seg.map(r => ({ x: X(r), y: U.spd(r.v) }));
   cg.data.datasets[0].data = seg.map(r => ({ x: X(r), y: r.gy }));
   cg.data.datasets[1].data = seg.map(r => ({ x: X(r), y: r.gx }));
-  ca.data.datasets[0].data = seg.map(r => ({ x: X(r), y: r.h }));
-  for (const c of S.charts) { c.$base = a; c.update(); }
+  ca.data.datasets[0].data = seg.map(r => ({ x: X(r), y: U.hgt(r.h) }));
+  for (const c of S.charts) { c.$base = a; c.options.scales.y.title.text = c.$yTitle(); c.update(); }
   document.getElementById('viewLabel').textContent = S.sel === null ? '· whole session' : `· lap ${S.laps[S.sel].label}`;
 }
 
 /* ---------- laps table ---------- */
 function buildLapTable() {
   const tb = document.getElementById('lapBody');
+  document.getElementById('thMax').textContent = 'Max ' + U.spdU();
+  document.getElementById('thAvg').textContent = 'Avg ' + U.spdU();
   if (!S.laps.length) {
     tb.innerHTML = `<tr><td colspan="6" class="partial">${S.data.sf ? 'No start/finish crossings found' : 'No start/finish line in file'}</td></tr>`;
     return;
@@ -488,7 +520,7 @@ function buildLapTable() {
       <td>${l.partial ? l.label + ' lap' : 'Lap ' + l.label}</td>
       <td class="${l.partial ? 'partial' : ''}">${fmtLap(l.time)}</td>
       <td class="${l.partial ? 'partial' : ''}">${l.partial || best === null ? '—' : (l.time === best ? '' : '+') + (l.time - best).toFixed(2)}</td>
-      <td>${l.max.toFixed(1)}</td><td>${l.avg.toFixed(1)}</td><td>${l.maxGy.toFixed(2)}</td>
+      <td>${U.spd(l.max).toFixed(1)}</td><td>${U.spd(l.avg).toFixed(1)}</td><td>${l.maxGy.toFixed(2)}</td>
     </tr>`).join('');
   tb.querySelectorAll('tr').forEach(tr => tr.onclick = () => selectLap(+tr.dataset.i));
 }
@@ -511,13 +543,50 @@ function setCursor(i, src) {
   const lapT = lap ? r.t - lap.t0 : r.t;
   const utc = new Date(r.tod * 1000).toISOString().substr(11, 8);
   const cells = [
-    ['Speed', r.v.toFixed(1) + ' km/h'], ['Lateral', r.gy.toFixed(2) + ' g'], ['Longitudinal', r.gx.toFixed(2) + ' g'],
-    ['Heading', r.hdg.toFixed(0) + '°'], ['Height', r.h.toFixed(1) + ' m'],
+    ['Speed', U.spd(r.v).toFixed(1) + ' ' + U.spdU()], ['Lateral', r.gy.toFixed(2) + ' g'], ['Longitudinal', r.gx.toFixed(2) + ' g'],
+    ['Heading', r.hdg.toFixed(0) + '°'], ['Height', U.hgt(r.h).toFixed(0) + ' ' + U.hgtU()],
     ['Lap time', (lap ? lap.label + ' · ' : '') + fmtLap(Math.max(0, lapT))],
     ['Session', fmtClock(r.t)], ['UTC', utc], ['Sats', String(r.sats)],
   ];
   if (r.avi !== null) cells.push(['Video', fmtClock(r.avi / 1000)]);
   document.getElementById('readout').innerHTML = cells.map(([k, v]) => `<div>${k}<b>${v}</b></div>`).join('');
+  drawGG();
+}
+
+/* ---------- G-G friction circle ---------- */
+function drawGG() {
+  const cv = document.getElementById('gg');
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1, size = 200;
+  if (cv.width !== size * dpr) { cv.width = cv.height = size * dpr; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size, size);
+  const c = size / 2, maxG = 1.5, R = c - 14, k = R / maxG;
+  const px = r => [c + r.gy * k, c - r.gx * k];
+
+  ctx.strokeStyle = '#262b36'; ctx.lineWidth = 1;
+  for (const g of [0.5, 1, 1.5]) { ctx.beginPath(); ctx.arc(c, c, g * k, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(c - R, c); ctx.lineTo(c + R, c); ctx.moveTo(c, c - R); ctx.lineTo(c, c + R); ctx.stroke();
+  ctx.fillStyle = '#8b93a7'; ctx.font = '9px system-ui, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('accel', c, 9); ctx.fillText('brake', c, size - 3);
+  ctx.textAlign = 'left'; ctx.fillText('R', c + R + 2, c + 3);
+  ctx.textAlign = 'right'; ctx.fillText('L', c - R - 2, c + 3);
+  ctx.textAlign = 'left';
+  for (const g of [0.5, 1, 1.5]) ctx.fillText(g + 'g', c + g * k * 0.7071 + 2, c + g * k * 0.7071 + 9);
+
+  const [a, b] = range();
+  const rows = S.data.rows;
+  ctx.fillStyle = 'rgba(79,195,247,.28)';
+  for (let i = a; i <= b; i++) { const [x, y] = px(rows[i]); ctx.fillRect(x - 1, y - 1, 2, 2); }
+
+  const r = rows[S.cursor], [x, y] = px(r);
+  ctx.strokeStyle = '#ffb74d'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(x, y); ctx.stroke();
+  ctx.fillStyle = '#ffb74d'; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = '#e6e8ee'; ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(Math.hypot(r.gx, r.gy).toFixed(2) + ' g', 4, size - 4);
 }
 
 /* ---------- loading ---------- */
@@ -526,6 +595,9 @@ function loadText(text, name) {
   catch (e) { alert('Could not read file: ' + e.message); console.error(e); }
 }
 function loadFile(f) { f.text().then(t => loadText(t, f.name)); }
+
+document.querySelectorAll('#units button').forEach(b => b.onclick = () => setUnits(b.dataset.u));
+setUnits(S.units);
 
 document.getElementById('file').onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
 document.getElementById('sample').onclick = () =>
