@@ -106,12 +106,15 @@
   .fpv-stage { position: relative; height: 300px; overflow: hidden;
     perspective: 460px; perspective-origin: 50% 50%;
     background: linear-gradient(#060a12 0%, #0d2137 38%, #1d3b57 52%, #2b3a46 58%, #0f1115 58%); }
-  .fpv-cam { position: absolute; left: 50%; top: 50%; width: 1200px; height: 1400px;
-    margin-left: -600px; margin-top: -700px; will-change: transform; }
+  /* The car sits at 78% down the plane, so most of the loaded ground lies ahead
+     of it rather than being wasted behind. Margins put that point at stage centre. */
+  .fpv-cam { position: absolute; left: 50%; top: 50%; width: 1600px; height: 2000px;
+    margin-left: -800px; margin-top: -1560px; transform-origin: 50% 78%; will-change: transform; }
   .fpv-map { width: 100%; height: 100%; background: #14181f; }
   /* softens the far edge of the projected ground into the sky */
   .fpv-haze { position: absolute; inset: 0; pointer-events: none;
-    background: linear-gradient(#1d3b57 0%, rgba(29,59,87,.85) 6%, rgba(29,59,87,0) 26%); }
+    background: linear-gradient(#1d3b57 0%, #1d3b57 9%, rgba(29,59,87,.75) 16%,
+      rgba(29,59,87,.3) 26%, rgba(29,59,87,0) 40%); }
   .fpv-credit { position: absolute; right: 6px; top: 4px; font-size: 10px; color: rgba(255,255,255,.5); }
   .video { position: relative; background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .video video { display: block; width: 100%; max-height: 320px; background: #000; }
@@ -327,6 +330,8 @@ function detectLaps(rows, sf) {
 const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
   chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null };
 try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
+let savedRate = 1;
+try { const v = +localStorage.getItem('vbo.rate'); if ([0.25, 0.5, 1, 2, 4].includes(v)) savedRate = v; } catch (e) {}
 
 const U = {
   imp: () => S.units === 'imperial',
@@ -443,7 +448,12 @@ function buildTransport() {
   const play = document.getElementById('play'), scrub = document.getElementById('scrub');
   play.onclick = () => Play.toggle();
   scrub.oninput = () => { Play.pause(); seekIndex(+scrub.value); };
-  document.getElementById('rate').onchange = e => Play.setRate(+e.target.value);
+  const rate = document.getElementById('rate');
+  rate.value = String(Play.rate);
+  rate.onchange = e => {
+    Play.setRate(+e.target.value);
+    try { localStorage.setItem('vbo.rate', e.target.value); } catch (err) {}
+  };
   document.getElementById('fpvOn').onchange = e => toggleFPV(e.target.checked);
   document.getElementById('chase').onchange = e => {
     S.chase = e.target.checked;
@@ -452,7 +462,7 @@ function buildTransport() {
 }
 
 const Play = {
-  on: false, rate: 1, raf: 0, last: 0, t: 0,
+  on: false, rate: savedRate, raf: 0, last: 0, t: 0,
   toggle() { this.on ? this.pause() : this.start(); },
   start() {
     const [a, b] = range();
@@ -524,7 +534,9 @@ function followCar() {
 /* ---------- fly-by view ---------- */
 // The ground is real satellite imagery: a Leaflet map tilted into the ground
 // plane with CSS 3D, rotated so the car's heading points into the screen.
-const FPV = { tilt: 72, drop: 104, zoom: 19, map: null, line: null };
+// zoom 18 rather than 19: each tile covers four times the ground, which is what
+// buys enough distance to reach the horizon without loading hundreds of tiles.
+const FPV = { tilt: 72, drop: 104, zoom: 18, ahead: 560, map: null, line: null };
 
 function toggleFPV(on) {
   S.fpv = on;
@@ -545,7 +557,7 @@ function buildFPVMap() {
     boxZoom: false, keyboard: false, touchZoom: false, inertia: false, fadeAnimation: false,
   });
   L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-    maxZoom: 21, maxNativeZoom: 19, keepBuffer: 4,
+    maxZoom: 21, maxNativeZoom: 19, keepBuffer: 6,
   }).addTo(m);
   m.setView([S.data.rows[0].lat, S.data.rows[0].lon], FPV.zoom);
   FPV.map = m;
@@ -576,7 +588,7 @@ function drawFPV() {
   const r = S.data.rows[S.cursor];
   const { dx, dy } = camOffset(FPV.map, r, 220);
   document.getElementById('fpvCam').style.transform =
-    `translateY(${FPV.drop}px) rotateX(${FPV.tilt}deg) rotate(${-r.hdgS}deg) translate(${-dx}px, ${-dy}px)`;
+    `translateY(${FPV.drop}px) rotateX(${FPV.tilt}deg) rotate(${-r.hdgS}deg) translate(${-dx}px, ${FPV.ahead - dy}px)`;
   document.getElementById('fhudSpeed').textContent = U.spd(r.v).toFixed(0) + ' ' + U.spdU();
   document.getElementById('fhudG').textContent = Math.hypot(r.gx, r.gy).toFixed(2) + ' g';
 }
