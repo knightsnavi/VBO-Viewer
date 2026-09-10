@@ -36,6 +36,8 @@
   .stat .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
   .stat .v small { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 3px; }
 
+  /* grid items default to min-width:auto, which lets the table and charts push the column wider than the screen */
+  .stats, .left, .right { min-width: 0; }
   .left { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
   #map { flex: 1; min-height: 340px; border-radius: 8px; border: 1px solid var(--line); background: #0b0d11; }
   .leaflet-container { background: #0b0d11; }
@@ -56,6 +58,7 @@
     color: var(--muted); text-transform: uppercase; letter-spacing: .5px; display: flex; justify-content: space-between; }
   .laps h2 button { font-size: 11px; padding: 2px 8px; }
   .laps .scroll { max-height: 220px; overflow: auto; }
+  .laps table { min-width: 420px; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th, td { padding: 6px 12px; text-align: right; border-bottom: 1px solid var(--line); }
   th:first-child, td:first-child { text-align: left; }
@@ -67,7 +70,8 @@
   td.partial { color: var(--muted); font-style: italic; }
 
   .right { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
-  .live { display: flex; gap: 10px; align-items: stretch; }
+  .live { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
+  .live .readout { min-width: 240px; }
   .readout { flex: 1; display: grid; grid-template-columns: repeat(auto-fit, minmax(95px, 1fr)); gap: 6px;
     align-content: start; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
   .gg { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; display: grid; place-items: center; }
@@ -79,12 +83,25 @@
   .readout b { display: block; color: var(--text); font-size: 15px; font-variant-numeric: tabular-nums; }
   .toolbar { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
   .toolbar .spacer { flex: 1; }
-  .transport { display: flex; gap: 10px; align-items: center; background: var(--panel);
+  .transport { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; background: var(--panel);
     border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
   .transport .play { width: 38px; text-align: center; padding: 6px 0; }
   .transport input[type=range] { flex: 1; accent-color: var(--accent); min-width: 80px; }
   .tcode { font-variant-numeric: tabular-nums; font-size: 13px; min-width: 44px; text-align: right; }
   .chase { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .mini { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px;
+    display: grid; place-items: center; }
+  .mini-view { position: relative; width: 200px; height: 200px; border-radius: 50%; overflow: hidden;
+    background: #14181f; box-shadow: inset 0 0 0 1px var(--line); }
+  .mini-cam { position: absolute; left: 50%; top: 50%; width: 340px; height: 340px;
+    margin: -170px 0 0 -170px; will-change: transform; }
+  .mini-map { width: 100%; height: 100%; background: #14181f; }
+  .mini-car { position: absolute; left: 50%; top: 50%; width: 0; height: 0; margin: -7px 0 0 -6px;
+    border-left: 6px solid transparent; border-right: 6px solid transparent;
+    border-bottom: 14px solid #fff; filter: drop-shadow(0 0 2px #000); }
+  .mini-n { position: absolute; left: 50%; top: 50%; width: 0; height: 0; }
+  .mini-n span { position: absolute; left: -5px; top: -94px; font: 700 11px system-ui, sans-serif;
+    color: var(--accent); text-shadow: 0 0 3px #000; }
   .fpv { position: relative; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .fpv-stage { position: relative; height: 300px; overflow: hidden;
     perspective: 460px; perspective-origin: 50% 50%;
@@ -106,6 +123,12 @@
   .empty { grid-column: 1 / -1; text-align: center; color: var(--muted); padding: 60px 20px; }
   .empty b { color: var(--text); }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } #map { min-height: 300px; } }
+  @media (max-width: 560px) {
+    .gg, .mini { flex: 1; }
+    .gg canvas { width: 168px; height: 168px; }
+    .mini-view { width: 168px; height: 168px; }
+    .mini-n span { top: -78px; }
+  }
 </style>
 </head>
 <body>
@@ -345,7 +368,7 @@ function build(parsed, name) {
   // a video loaded against the previous log no longer lines up
   if (S.vidUrl) { URL.revokeObjectURL(S.vidUrl); S.vidUrl = null; }
   S.video = null; S.videoReady = false; S.videoSync = false;
-  S.fpv = false; FPV.map = null; FPV.line = null;
+  S.fpv = false; FPV.map = null; FPV.line = null; Mini.map = null; Mini.line = null;
   document.getElementById('vidName').textContent = '';
   document.getElementById('vidFile').value = '';
 
@@ -368,6 +391,13 @@ function build(parsed, name) {
       <div class="live">
         <div class="readout" id="readout"></div>
         <div class="gg" title="G-G diagram: lateral G left/right, longitudinal G up (accel) / down (braking)"><canvas id="gg"></canvas></div>
+        <div class="mini" title="Heading-up satellite inset — the track around you, rotated so you are always driving upward">
+          <div class="mini-view">
+            <div class="mini-cam" id="miniCam"><div class="mini-map" id="minimap"></div></div>
+            <div class="mini-n" id="miniN"><span>N</span></div>
+            <div class="mini-car"></div>
+          </div>
+        </div>
       </div>
       <div class="transport">
         <button class="btn play" id="play" title="Play / pause (space)">▶</button>
@@ -502,7 +532,8 @@ function toggleFPV(on) {
   if (!on) return;
   if (!FPV.map) buildFPVMap();
   FPV.map.invalidateSize();
-  recentreFPV(true);
+  const r = S.data.rows[S.cursor];
+  FPV.map.setView([r.lat, r.lon], FPV.zoom, { animate: false });
   drawFPVLine();
   drawFPV();
 }
@@ -520,16 +551,17 @@ function buildFPVMap() {
   FPV.map = m;
 }
 
-function recentreFPV(force) {
-  const r = S.data.rows[S.cursor];
-  if (force) { FPV.map.setView([r.lat, r.lon], FPV.zoom, { animate: false }); return true; }
-  const p = FPV.map.latLngToContainerPoint([r.lat, r.lon]);
-  const c = FPV.map.getSize().divideBy(2);
-  if (Math.abs(p.x - c.x) > 220 || Math.abs(p.y - c.y) > 220) {
-    FPV.map.setView([r.lat, r.lon], FPV.zoom, { animate: false });
-    return true;
+// Pixel offset of the car from the map's centre, recentring the map only once
+// it drifts far out — panning every frame would reload tiles constantly.
+function camOffset(map, r, limit) {
+  const p = map.latLngToContainerPoint([r.lat, r.lon]);
+  const c = map.getSize().divideBy(2);
+  const dx = p.x - c.x, dy = p.y - c.y;
+  if (Math.abs(dx) > limit || Math.abs(dy) > limit) {
+    map.setView([r.lat, r.lon], map.getZoom(), { animate: false });
+    return { dx: 0, dy: 0 };
   }
-  return false;
+  return { dx, dy };
 }
 
 function drawFPVLine() {
@@ -542,14 +574,46 @@ function drawFPVLine() {
 function drawFPV() {
   if (!S.fpv || !FPV.map) return;
   const r = S.data.rows[S.cursor];
-  recentreFPV(false);
-  const p = FPV.map.latLngToContainerPoint([r.lat, r.lon]);
-  const c = FPV.map.getSize().divideBy(2);
-  const dx = p.x - c.x, dy = p.y - c.y;
+  const { dx, dy } = camOffset(FPV.map, r, 220);
   document.getElementById('fpvCam').style.transform =
     `translateY(${FPV.drop}px) rotateX(${FPV.tilt}deg) rotate(${-r.hdgS}deg) translate(${-dx}px, ${-dy}px)`;
   document.getElementById('fhudSpeed').textContent = U.spd(r.v).toFixed(0) + ' ' + U.spdU();
   document.getElementById('fhudG').textContent = Math.hypot(r.gx, r.gy).toFixed(2) + ' g';
+}
+
+/* ---------- heading-up satellite inset ---------- */
+const Mini = { zoom: 18, map: null, line: null };
+
+function buildMiniMap() {
+  const m = L.map('minimap', {
+    zoomControl: false, attributionControl: false, preferCanvas: true,
+    dragging: false, scrollWheelZoom: false, doubleClickZoom: false,
+    boxZoom: false, keyboard: false, touchZoom: false, inertia: false, fadeAnimation: false,
+  });
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 21, maxNativeZoom: 19, keepBuffer: 3,
+  }).addTo(m);
+  m.setView([S.data.rows[S.cursor].lat, S.data.rows[S.cursor].lon], Mini.zoom);
+  Mini.map = m;
+  drawMiniLine();
+}
+
+function drawMiniLine() {
+  if (!Mini.map) return;
+  if (Mini.line) Mini.map.removeLayer(Mini.line);
+  const [a, b] = range();
+  Mini.line = L.polyline(S.data.rows.slice(a, b + 1).map(r => [r.lat, r.lon]),
+    { color: '#4fc3f7', weight: 3, opacity: .85, interactive: false }).addTo(Mini.map);
+}
+
+function drawMini() {
+  if (!document.getElementById('miniCam')) return;
+  if (!Mini.map) buildMiniMap();
+  const r = S.data.rows[S.cursor];
+  const { dx, dy } = camOffset(Mini.map, r, 90);
+  document.getElementById('miniCam').style.transform =
+    `rotate(${-r.hdgS}deg) translate(${-dx}px, ${-dy}px)`;
+  document.getElementById('miniN').style.transform = `rotate(${-r.hdgS}deg)`;
 }
 
 /* ---------- video sync ---------- */
@@ -811,6 +875,7 @@ function selectLap(i) {
   document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === i));
   buildStats(); drawTrack(); refreshCharts();
   if (S.fpv && FPV.map) drawFPVLine();
+  drawMiniLine();
   setCursor(range()[0]);
 }
 
@@ -833,6 +898,7 @@ function setCursor(i, src) {
   if (r.avi !== null) cells.push(['Video', fmtClock(r.avi / 1000)]);
   document.getElementById('readout').innerHTML = cells.map(([k, v]) => `<div>${k}<b>${v}</b></div>`).join('');
   drawGG();
+  drawMini();
   drawFPV();
 
   const [a, b] = range();

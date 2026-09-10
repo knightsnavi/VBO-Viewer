@@ -11,6 +11,7 @@ Lets you view and browse your VBO vehicle data files — a single-page web app f
 - Hover the charts or the map to see every channel at that instant, including the matching VBOX video timestamp
 - "Set start/finish at cursor" to place a gate on files that have no lap line
 - Replay with play/pause, scrub, 0.25×–4× speed, and a chase cam that keeps the car centred
+- A heading-up satellite inset beside the G-G gauge — the track immediately around the car, rotated so you are always driving upward, with a rotating north marker
 - **Fly-by** — a driver's-eye view built by projecting satellite imagery onto the ground plane and rotating it to your heading, so you see the real track surface with the racing line running ahead into the next corner
 - Synchronised video: load the VBOX `.mp4` recordings and the footage tracks the data both ways, with a speed/G overlay
 - Basemap switcher — satellite imagery, OSM street, or dark
