@@ -11,6 +11,7 @@ Lets you view and browse your VBO vehicle data files — a single-page web app f
 - Hover the charts or the map to see every channel at that instant, including the matching VBOX video timestamp
 - "Set start/finish at cursor" to place a gate on files that have no lap line
 - Replay with play/pause, scrub, 0.25×–4× speed, and a chase cam that keeps the car centred
+- **Fly-by** — a driver's-eye view built by projecting satellite imagery onto the ground plane and rotating it to your heading, so you see the real track surface with the racing line running ahead into the next corner
 - Synchronised video: load the VBOX `.mp4` recordings and the footage tracks the data both ways, with a speed/G overlay
 - Basemap switcher — satellite imagery, OSM street, or dark
 
@@ -23,6 +24,8 @@ Lets you view and browse your VBO vehicle data files — a single-page web app f
 Open `index.html` (or the GitHub Pages site) and drop a `.vbo` file onto the page, or click **Load sample**.
 
 ## Notes on the format
+
+The fly-by view needs no 3D model and no extra imagery: it is the same aerial tiles as the map, tilted with a CSS 3D transform and spun to a speed-weighted smoothing of the GPS heading. It works because the circuit is flat — the trick degrades on tracks with real elevation change, since aerial imagery carries no height.
 
 The `avitime` column is the position in the recording, in milliseconds, for every logged row, so video sync needs no manual alignment. Your video never leaves the browser. If a clip does not cover the span the log points at, the viewer says so and falls back to free-running playback instead of stalling.
 

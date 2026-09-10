@@ -85,6 +85,17 @@
   .transport input[type=range] { flex: 1; accent-color: var(--accent); min-width: 80px; }
   .tcode { font-variant-numeric: tabular-nums; font-size: 13px; min-width: 44px; text-align: right; }
   .chase { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .fpv { position: relative; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .fpv-stage { position: relative; height: 300px; overflow: hidden;
+    perspective: 460px; perspective-origin: 50% 50%;
+    background: linear-gradient(#060a12 0%, #0d2137 38%, #1d3b57 52%, #2b3a46 58%, #0f1115 58%); }
+  .fpv-cam { position: absolute; left: 50%; top: 50%; width: 1200px; height: 1400px;
+    margin-left: -600px; margin-top: -700px; will-change: transform; }
+  .fpv-map { width: 100%; height: 100%; background: #14181f; }
+  /* softens the far edge of the projected ground into the sky */
+  .fpv-haze { position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(#1d3b57 0%, rgba(29,59,87,.85) 6%, rgba(29,59,87,0) 26%); }
+  .fpv-credit { position: absolute; right: 6px; top: 4px; font-size: 10px; color: rgba(255,255,255,.5); }
   .video { position: relative; background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .video video { display: block; width: 100%; max-height: 320px; background: #000; }
   .vhud { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 10px;
@@ -206,6 +217,13 @@ function derive(rows) {
   }
   const gxs = smooth(rows.map(r => r.gx), 5), gys = smooth(rows.map(r => r.gy), 5);
   rows.forEach((r, i) => { r.gx = gxs[i]; r.gy = gys[i]; });
+
+  // GPS heading is noisy and meaningless when crawling, so smooth it as a
+  // speed-weighted vector — a plain average would tear across the 360/0 wrap.
+  const w = rows.map(r => Math.max(r.v, 1));
+  const hx = smooth(rows.map((r, i) => Math.sin(r.hdg * Math.PI / 180) * w[i]), 9);
+  const hy = smooth(rows.map((r, i) => Math.cos(r.hdg * Math.PI / 180) * w[i]), 9);
+  rows.forEach((r, i) => { r.hdgS = (Math.atan2(hx[i], hy[i]) * 180 / Math.PI + 360) % 360; });
 }
 
 function smooth(a, w) {
@@ -284,7 +302,7 @@ function detectLaps(rows, sf) {
 
 /* ---------- app state ---------- */
 const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
-  chase: false, video: null, videoReady: false, videoSync: false, vidUrl: null };
+  chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null };
 try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
 
 const U = {
@@ -327,6 +345,7 @@ function build(parsed, name) {
   // a video loaded against the previous log no longer lines up
   if (S.vidUrl) { URL.revokeObjectURL(S.vidUrl); S.vidUrl = null; }
   S.video = null; S.videoReady = false; S.videoSync = false;
+  S.fpv = false; FPV.map = null; FPV.line = null;
   document.getElementById('vidName').textContent = '';
   document.getElementById('vidFile').value = '';
 
@@ -358,11 +377,20 @@ function build(parsed, name) {
           <option>0.25</option><option>0.5</option><option selected>1</option><option>2</option><option>4</option>
         </select>
         <label class="chase"><input type="checkbox" id="chase"> Chase cam</label>
+        <label class="chase"><input type="checkbox" id="fpvOn"> Fly-by</label>
       </div>
       <div class="toolbar">
         X axis:
         <select id="xMode"><option value="time">Time</option><option value="dist">Distance</option></select>
         <span id="viewLabel"></span>
+      </div>
+      <div class="fpv" id="fpvPanel" hidden>
+        <div class="fpv-stage">
+          <div class="fpv-cam" id="fpvCam"><div class="fpv-map" id="fpvmap"></div></div>
+          <div class="fpv-haze"></div>
+          <div class="fpv-credit">Imagery &copy; Esri</div>
+        </div>
+        <div class="vhud"><span id="fhudSpeed"></span><span id="fhudG"></span></div>
       </div>
       <div class="video" id="videoWrap" hidden>
         <video id="video" playsinline muted preload="auto"></video>
@@ -386,6 +414,7 @@ function buildTransport() {
   play.onclick = () => Play.toggle();
   scrub.oninput = () => { Play.pause(); seekIndex(+scrub.value); };
   document.getElementById('rate').onchange = e => Play.setRate(+e.target.value);
+  document.getElementById('fpvOn').onchange = e => toggleFPV(e.target.checked);
   document.getElementById('chase').onchange = e => {
     S.chase = e.target.checked;
     if (!S.chase) drawTrack(); else followCar();
@@ -460,6 +489,67 @@ function seekIndex(i, fromClock) {
 function followCar() {
   const r = S.data.rows[S.cursor];
   S.map.setView([r.lat, r.lon], Math.max(S.map.getZoom(), 17), { animate: false });
+}
+
+/* ---------- fly-by view ---------- */
+// The ground is real satellite imagery: a Leaflet map tilted into the ground
+// plane with CSS 3D, rotated so the car's heading points into the screen.
+const FPV = { tilt: 72, drop: 104, zoom: 19, map: null, line: null };
+
+function toggleFPV(on) {
+  S.fpv = on;
+  document.getElementById('fpvPanel').hidden = !on;
+  if (!on) return;
+  if (!FPV.map) buildFPVMap();
+  FPV.map.invalidateSize();
+  recentreFPV(true);
+  drawFPVLine();
+  drawFPV();
+}
+
+function buildFPVMap() {
+  const m = L.map('fpvmap', {
+    zoomControl: false, attributionControl: false, preferCanvas: true,
+    dragging: false, scrollWheelZoom: false, doubleClickZoom: false,
+    boxZoom: false, keyboard: false, touchZoom: false, inertia: false, fadeAnimation: false,
+  });
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 21, maxNativeZoom: 19, keepBuffer: 4,
+  }).addTo(m);
+  m.setView([S.data.rows[0].lat, S.data.rows[0].lon], FPV.zoom);
+  FPV.map = m;
+}
+
+function recentreFPV(force) {
+  const r = S.data.rows[S.cursor];
+  if (force) { FPV.map.setView([r.lat, r.lon], FPV.zoom, { animate: false }); return true; }
+  const p = FPV.map.latLngToContainerPoint([r.lat, r.lon]);
+  const c = FPV.map.getSize().divideBy(2);
+  if (Math.abs(p.x - c.x) > 220 || Math.abs(p.y - c.y) > 220) {
+    FPV.map.setView([r.lat, r.lon], FPV.zoom, { animate: false });
+    return true;
+  }
+  return false;
+}
+
+function drawFPVLine() {
+  if (FPV.line) FPV.map.removeLayer(FPV.line);
+  const [a, b] = range();
+  FPV.line = L.polyline(S.data.rows.slice(a, b + 1).map(r => [r.lat, r.lon]),
+    { color: '#4fc3f7', weight: 6, opacity: .8, interactive: false }).addTo(FPV.map);
+}
+
+function drawFPV() {
+  if (!S.fpv || !FPV.map) return;
+  const r = S.data.rows[S.cursor];
+  recentreFPV(false);
+  const p = FPV.map.latLngToContainerPoint([r.lat, r.lon]);
+  const c = FPV.map.getSize().divideBy(2);
+  const dx = p.x - c.x, dy = p.y - c.y;
+  document.getElementById('fpvCam').style.transform =
+    `translateY(${FPV.drop}px) rotateX(${FPV.tilt}deg) rotate(${-r.hdgS}deg) translate(${-dx}px, ${-dy}px)`;
+  document.getElementById('fhudSpeed').textContent = U.spd(r.v).toFixed(0) + ' ' + U.spdU();
+  document.getElementById('fhudG').textContent = Math.hypot(r.gx, r.gy).toFixed(2) + ' g';
 }
 
 /* ---------- video sync ---------- */
@@ -720,6 +810,7 @@ function selectLap(i) {
   S.sel = i;
   document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === i));
   buildStats(); drawTrack(); refreshCharts();
+  if (S.fpv && FPV.map) drawFPVLine();
   setCursor(range()[0]);
 }
 
@@ -742,6 +833,7 @@ function setCursor(i, src) {
   if (r.avi !== null) cells.push(['Video', fmtClock(r.avi / 1000)]);
   document.getElementById('readout').innerHTML = cells.map(([k, v]) => `<div>${k}<b>${v}</b></div>`).join('');
   drawGG();
+  drawFPV();
 
   const [a, b] = range();
   const scrub = document.getElementById('scrub');
