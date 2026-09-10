@@ -102,7 +102,9 @@
   <h1><span>VBO</span> Viewer</h1>
   <label class="btn">Open .vbo file<input id="file" type="file" accept=".vbo,.txt"></label>
   <button class="btn" id="sample">Load sample</button>
+  <label class="btn" id="vidBtn">Load video<input id="vidFile" type="file" accept="video/*" multiple></label>
   <span class="seg" id="units"><button data-u="metric">km/h</button><button data-u="imperial">mph</button></span>
+  <span id="vidName"></span>
   <span id="fileName">No file loaded — drop a .vbo anywhere</span>
 </header>
 <div id="drop">Drop your .vbo file</div>
@@ -322,6 +324,11 @@ function build(parsed, name) {
   S.laps = detectLaps(parsed.rows, parsed.sf);
   S.sel = null; S.cursor = 0;
   document.getElementById('fileName').textContent = `${name} · ${parsed.unit || 'VBOX'} · ${parsed.created}`;
+  // a video loaded against the previous log no longer lines up
+  if (S.vidUrl) { URL.revokeObjectURL(S.vidUrl); S.vidUrl = null; }
+  S.video = null; S.videoReady = false; S.videoSync = false;
+  document.getElementById('vidName').textContent = '';
+  document.getElementById('vidFile').value = '';
 
   const main = document.getElementById('main');
   main.innerHTML = `
@@ -356,9 +363,6 @@ function build(parsed, name) {
         X axis:
         <select id="xMode"><option value="time">Time</option><option value="dist">Distance</option></select>
         <span id="viewLabel"></span>
-        <span class="spacer"></span>
-        <label class="btn" id="vidBtn">Load video<input id="vidFile" type="file" accept="video/*" multiple></label>
-        <span id="vidName"></span>
       </div>
       <div class="video" id="videoWrap" hidden>
         <video id="video" playsinline muted preload="auto"></video>
@@ -386,7 +390,6 @@ function buildTransport() {
     S.chase = e.target.checked;
     if (!S.chase) drawTrack(); else followCar();
   };
-  document.getElementById('vidFile').onchange = e => loadVideos([...e.target.files]);
 }
 
 const Play = {
@@ -810,6 +813,10 @@ document.querySelectorAll('#units button').forEach(b => b.onclick = () => setUni
 setUnits(S.units);
 
 document.getElementById('file').onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
+document.getElementById('vidFile').onchange = e => {
+  if (!S.data) { alert('Open a .vbo log first — the video syncs to its data.'); e.target.value = ''; return; }
+  loadVideos([...e.target.files]);
+};
 document.getElementById('sample').onclick = () =>
   fetch('sample/DR_15290001.vbo').then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); })
     .then(t => loadText(t, 'DR_15290001.vbo'))
