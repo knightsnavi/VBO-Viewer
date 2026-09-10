@@ -46,6 +46,11 @@
   .legend .bar { height: 8px; width: 140px; border-radius: 4px; margin: 4px 0;
     background: linear-gradient(90deg,#3b5bdb,#22b8cf,#51cf66,#fcc419,#ff6b6b); }
   .legend .ends { display: flex; justify-content: space-between; }
+  .legend .laps-key { display: grid; grid-template-columns: repeat(2, auto); gap: 2px 10px; margin-top: 4px; }
+  .legend .laps-key span { display: flex; align-items: center; gap: 5px; color: var(--text); white-space: nowrap; }
+  .legend .laps-key i { width: 12px; height: 3px; border-radius: 2px; flex: none; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px;
+    vertical-align: -1px; }
   .leaflet-control-layers { background: rgba(23,26,33,.92) !important; color: var(--text);
     border: 1px solid var(--line) !important; }
   .leaflet-control-layers-toggle { background-color: rgba(23,26,33,.92); }
@@ -328,8 +333,9 @@ function detectLaps(rows, sf) {
 
 /* ---------- app state ---------- */
 const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
-  chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null };
+  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null };
 try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
+try { if (localStorage.getItem('vbo.colorBy') === 'lap') S.colorBy = 'lap'; } catch (e) {}
 let savedRate = 1;
 try { const v = +localStorage.getItem('vbo.rate'); if ([0.25, 0.5, 1, 2, 4].includes(v)) savedRate = v; } catch (e) {}
 
@@ -357,6 +363,44 @@ function fmtClock(s) {
   const m = Math.floor(s / 60), r = Math.floor(s - m * 60);
   return `${m}:${String(r).padStart(2, '0')}`;
 }
+// Golden-angle hue steps keep adjacent laps far apart in colour however many there are.
+function assignLapColors() {
+  let k = 0;
+  for (const l of S.laps) l.color = l.partial ? '#8b93a7' : `hsl(${(k++ * 137.508) % 360} 78% 62%)`;
+}
+
+// Contiguous runs of rows that share a lap, for drawing one polyline per lap.
+function lapRuns(a, b) {
+  const runs = [];
+  for (const l of S.laps) {
+    const i0 = Math.max(l.i0, a), i1 = Math.min(l.i1, b);
+    if (i1 > i0) runs.push({ i0, i1, color: l.color, label: l.label });
+  }
+  return runs;
+}
+
+// The racing line for the inset and fly-by: one polyline per lap when colouring
+// by lap, otherwise a single accent-coloured line.
+function traceLayer(weight, opacity) {
+  const rows = S.data.rows, [a, b] = range();
+  const pts = (i0, i1) => rows.slice(i0, i1 + 1).map(r => [r.lat, r.lon]);
+  if (S.colorBy === 'lap' && S.laps.length) {
+    return L.featureGroup(lapRuns(a, b).map(run =>
+      L.polyline(pts(run.i0, run.i1), { color: run.color, weight, opacity, interactive: false })));
+  }
+  return L.featureGroup([L.polyline(pts(a, b), { color: '#4fc3f7', weight, opacity, interactive: false })]);
+}
+
+function setColorBy(c) {
+  S.colorBy = c;
+  try { localStorage.setItem('vbo.colorBy', c); } catch (e) {}
+  document.querySelectorAll('#colorBy button').forEach(b => b.classList.toggle('on', b.dataset.c === c));
+  if (!S.data) return;
+  drawTrack(); drawLegend(); buildLapTable(); drawMiniLine();
+  if (S.fpv && FPV.map) drawFPVLine();
+  document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === S.sel));
+}
+
 function speedColor(f) {
   const stops = [[59,91,219],[34,184,207],[81,207,102],[252,196,25],[255,107,107]];
   const p = Math.min(Math.max(f, 0), 0.9999) * (stops.length - 1), i = Math.floor(p), k = p - i;
@@ -368,6 +412,7 @@ function speedColor(f) {
 function build(parsed, name) {
   S.data = parsed; derive(parsed.rows);
   S.laps = detectLaps(parsed.rows, parsed.sf);
+  assignLapColors();
   S.sel = null; S.cursor = 0;
   document.getElementById('fileName').textContent = `${name} · ${parsed.unit || 'VBOX'} · ${parsed.created}`;
   // a video loaded against the previous log no longer lines up
@@ -385,7 +430,9 @@ function build(parsed, name) {
       <div class="laps">
         <h2><span>Laps</span><span>
           <button class="btn" id="setGate" title="Place a start/finish gate across the track at the current cursor position">Set start/finish at cursor</button>
-          <button class="btn" id="allLaps">Show whole session</button></span></h2>
+          <button class="btn" id="allLaps">Show whole session</button>
+          <span class="seg" id="colorBy"><button data-c="speed">Speed</button><button data-c="lap">Lap</button></span>
+          </span></h2>
         <div class="scroll"><table>
           <thead><tr><th>Lap</th><th>Time</th><th>Δ best</th><th id="thMax"></th><th id="thAvg"></th><th>Max lat G</th></tr></thead>
           <tbody id="lapBody"></tbody>
@@ -439,6 +486,8 @@ function build(parsed, name) {
   document.getElementById('allLaps').onclick = () => selectLap(null);
   document.getElementById('setGate').onclick = setGateAtCursor;
   document.getElementById('xMode').onchange = e => { S.xMode = e.target.value; refreshCharts(); };
+  document.querySelectorAll('#colorBy button').forEach(btn => btn.onclick = () => setColorBy(btn.dataset.c));
+  document.querySelectorAll('#colorBy button').forEach(b => b.classList.toggle('on', b.dataset.c === S.colorBy));
 
   buildMap(); buildCharts(); buildLapTable(); buildTransport(); selectLap(null);
 }
@@ -578,9 +627,7 @@ function camOffset(map, r, limit) {
 
 function drawFPVLine() {
   if (FPV.line) FPV.map.removeLayer(FPV.line);
-  const [a, b] = range();
-  FPV.line = L.polyline(S.data.rows.slice(a, b + 1).map(r => [r.lat, r.lon]),
-    { color: '#4fc3f7', weight: 6, opacity: .8, interactive: false }).addTo(FPV.map);
+  FPV.line = traceLayer(6, .8).addTo(FPV.map);
 }
 
 function drawFPV() {
@@ -613,9 +660,7 @@ function buildMiniMap() {
 function drawMiniLine() {
   if (!Mini.map) return;
   if (Mini.line) Mini.map.removeLayer(Mini.line);
-  const [a, b] = range();
-  Mini.line = L.polyline(S.data.rows.slice(a, b + 1).map(r => [r.lat, r.lon]),
-    { color: '#4fc3f7', weight: 3, opacity: .85, interactive: false }).addTo(Mini.map);
+  Mini.line = traceLayer(3, .85).addTo(Mini.map);
 }
 
 function drawMini() {
@@ -755,6 +800,11 @@ function buildMap() {
 
 function drawLegend() {
   if (!S.legendEl) return;
+  if (S.colorBy === 'lap' && S.laps.length) {
+    S.legendEl.innerHTML = 'Lap<div class="laps-key">' + S.laps.map(l =>
+      `<span><i style="background:${l.color}"></i>${l.partial ? l.label : 'Lap ' + l.label}</span>`).join('') + '</div>';
+    return;
+  }
   const max = U.spd(Math.max(...S.data.rows.map(r => r.v)));
   S.legendEl.innerHTML = `Speed<div class="bar"></div><div class="ends"><span>0</span><span>${max.toFixed(0)} ${U.spdU()}</span></div>`;
 }
@@ -770,7 +820,8 @@ function setGateAtCursor() {
   const rows = S.data.rows, r = rows[S.cursor];
   S.data.sf = { a: { lat: r.lat, lon: r.lon }, b: { lat: r.lat, lon: r.lon } };
   S.laps = detectLaps(rows, S.data.sf);
-  drawGate(); buildLapTable(); selectLap(null);
+  assignLapColors();
+  drawGate(); drawLegend(); buildLapTable(); selectLap(null);
 }
 
 function drawTrack() {
@@ -785,9 +836,16 @@ function drawTrack() {
   S.layers.push(L.polyline(rows.slice(a, b + 1).map(r => [r.lat, r.lon]),
     { color: '#000', weight: 8, opacity: .45, interactive: false }).addTo(map));
   const group = [];
-  for (let i = a; i < b; i++) {
-    group.push(L.polyline([[rows[i].lat, rows[i].lon], [rows[i + 1].lat, rows[i + 1].lon]],
-      { color: speedColor(rows[i].v / vmax), weight: 4, opacity: .95, interactive: false }));
+  if (S.colorBy === 'lap' && S.laps.length) {
+    for (const run of lapRuns(a, b)) {
+      group.push(L.polyline(rows.slice(run.i0, run.i1 + 1).map(r => [r.lat, r.lon]),
+        { color: run.color, weight: 4, opacity: .95, interactive: false }));
+    }
+  } else {
+    for (let i = a; i < b; i++) {
+      group.push(L.polyline([[rows[i].lat, rows[i].lon], [rows[i + 1].lat, rows[i + 1].lon]],
+        { color: speedColor(rows[i].v / vmax), weight: 4, opacity: .95, interactive: false }));
+    }
   }
   const fg = L.featureGroup(group).addTo(map);
   S.layers.push(fg);
@@ -873,7 +931,7 @@ function buildLapTable() {
   const best = full.length ? Math.min(...full.map(l => l.time)) : null;
   tb.innerHTML = S.laps.map((l, i) => `
     <tr data-i="${i}" class="${!l.partial && l.time === best ? 'best' : ''}">
-      <td>${l.partial ? l.label + ' lap' : 'Lap ' + l.label}</td>
+      <td>${S.colorBy === 'lap' ? `<i class="swatch" style="background:${l.color}"></i>` : ''}${l.partial ? l.label + ' lap' : 'Lap ' + l.label}</td>
       <td class="${l.partial ? 'partial' : ''}">${fmtLap(l.time)}</td>
       <td class="${l.partial ? 'partial' : ''}">${l.partial || best === null ? '—' : (l.time === best ? '' : '+') + (l.time - best).toFixed(2)}</td>
       <td>${U.spd(l.max).toFixed(1)}</td><td>${U.spd(l.avg).toFixed(1)}</td><td>${l.maxGy.toFixed(2)}</td>

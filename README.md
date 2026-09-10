@@ -8,6 +8,7 @@ Lets you view and browse your VBO vehicle data files — a single-page web app f
 - Speed, lateral/longitudinal G (derived from GPS speed and heading), and height traces
 - Lap timing from the file's `[laptiming]` start line, with best-lap highlighting and per-lap max/avg speed and peak lateral G
 - Click a lap to isolate it on the map and charts; switch the X axis between time and distance
+- Colour the racing line by speed or by lap — lap colouring makes line variation between laps obvious at a glance
 - Hover the charts or the map to see every channel at that instant, including the matching VBOX video timestamp
 - "Set start/finish at cursor" to place a gate on files that have no lap line
 - Replay with play/pause, scrub, 0.25×–4× speed, and a chase cam that keeps the car centred
