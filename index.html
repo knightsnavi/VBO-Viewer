@@ -11,6 +11,8 @@
     --accent: #4fc3f7; --good: #66e0a3; --warn: #ffb74d; --bad: #ff6b6b;
   }
   * { box-sizing: border-box; }
+  /* author display rules outrank the UA stylesheet's [hidden], so restate it */
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
     font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
