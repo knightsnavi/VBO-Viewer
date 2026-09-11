@@ -779,9 +779,9 @@ function reportVideoError(file, v, noPicture) {
   document.getElementById('vidName').style.color = 'var(--warn)';
   showNotice(
     `<b>${esc(file.name)}</b> did not play — ${why}. ` +
-    `Chrome often cannot decode H.265/HEVC, while Safari and iPhones reliably can, so a file that plays on your phone may fail here. ` +
     `This browser reports ${codecSupport()}. ` +
-    `Try opening this page in Safari, or convert the file once with ffmpeg: ` +
+    `If the file uses a codec listed as unsupported there — H.265/HEVC being the usual one, which Safari and iPhones play but Chrome often will not — ` +
+    `try this page in Safari, or convert it once with ffmpeg: ` +
     `<code>ffmpeg -i "${esc(file.name)}" -c:v libx264 -crf 20 -pix_fmt yuv420p -c:a aac out.mp4</code> ` +
     `— the converted file keeps the same timing, so it stays in sync.`);
 }
