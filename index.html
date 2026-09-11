@@ -131,7 +131,8 @@
       rgba(29,59,87,.3) 26%, rgba(29,59,87,0) 40%); }
   .fpv-credit { position: absolute; right: 6px; top: 4px; font-size: 10px; color: rgba(255,255,255,.5); }
   .video { position: relative; background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .video video { display: block; width: 100%; min-height: 40px; max-height: 320px; background: #000; }
+  .video video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9;
+    max-height: 320px; object-fit: contain; background: #000; }
   .vdiag { padding: 4px 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--muted); background: #12151c; border-top: 1px solid var(--line);
     user-select: all; word-break: break-word; }
@@ -734,6 +735,8 @@ function codecSupport() {
     .join(', ');
 }
 
+const codecProbe = type => document.createElement('video').canPlayType(type) || 'no';
+
 function updateVidDiag() {
   const el = document.getElementById('vdiag'), v = S.video;
   if (!el || !v) return;
@@ -746,8 +749,12 @@ function updateVidDiag() {
     `type ${S.vidType || 'unknown'}`,
     `readyState ${v.readyState}`,
     `picture ${v.videoWidth}x${v.videoHeight}`,
+    `box ${v.clientWidth}x${v.clientHeight}`,
     `duration ${isFinite(v.duration) ? v.duration.toFixed(1) + 's' : 'unknown'}`,
+    v.paused ? 'paused' : 'playing',
+    v.seeking ? 'seeking' : 'idle',
     `frames ${frames}`,
+    `can play mp4/h264 "${codecProbe('video/mp4; codecs="avc1.42E01E"')}" hevc "${codecProbe('video/mp4; codecs="hvc1.1.6.L93.B0"')}"`,
     v.error ? `ERROR ${v.error.code}` : 'no error',
   ].join(' · ');
 }
@@ -809,7 +816,7 @@ function loadVideos(files) {
     seekIndex(S.cursor);
   };
   v.onerror = () => reportVideoError(files[0], v);
-  for (const ev of ['loadeddata', 'canplay', 'timeupdate', 'stalled', 'suspend', 'waiting', 'playing'])
+  for (const ev of ['loadeddata', 'canplay', 'timeupdate', 'stalled', 'suspend', 'waiting', 'playing', 'seeked', 'pause'])
     v.addEventListener(ev, updateVidDiag);
   // some browsers neither load nor fire an error on a codec they half-recognise
   clearTimeout(S.vidTimer);
