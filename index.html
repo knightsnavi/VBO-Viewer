@@ -136,7 +136,7 @@
   .vdiag { padding: 4px 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--muted); background: #12151c; border-top: 1px solid var(--line);
     user-select: all; word-break: break-word; }
-  .vhud { position: absolute; left: 8px; bottom: 60px; display: flex; gap: 10px;
+  .vhud { position: absolute; left: 8px; bottom: 44px; display: flex; gap: 10px;
     font: 600 15px/1 system-ui, sans-serif; color: #fff; text-shadow: 0 1px 4px #000; font-variant-numeric: tabular-nums; }
   .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px 2px;
     position: relative; height: 180px; }
@@ -490,7 +490,7 @@ function build(parsed, name) {
       </div>
       <div class="video" id="videoWrap" hidden>
         <video id="video" playsinline muted controls preload="auto"></video>
-        <div class="vdiag" id="vdiag"></div>
+        <div class="vdiag" id="vdiag" hidden></div>
         <div class="vhud"><span id="vhudSpeed"></span><span id="vhudG"></span></div>
       </div>
       <div class="chart"><canvas id="cSpeed"></canvas></div>
@@ -740,6 +740,9 @@ const codecProbe = type => document.createElement('video').canPlayType(type) || 
 function updateVidDiag() {
   const el = document.getElementById('vdiag'), v = S.video;
   if (!el || !v) return;
+  // the readout is noise once a video is playing; it earns its place only on failure
+  el.hidden = S.videoReady && !v.error && v.videoWidth > 0;
+  if (el.hidden) return;
   let frames = 'n/a';
   if (v.getVideoPlaybackQuality) {
     const q = v.getVideoPlaybackQuality();
