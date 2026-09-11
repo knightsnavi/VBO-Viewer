@@ -131,12 +131,17 @@
       rgba(29,59,87,.3) 26%, rgba(29,59,87,0) 40%); }
   .fpv-credit { position: absolute; right: 6px; top: 4px; font-size: 10px; color: rgba(255,255,255,.5); }
   .video { position: relative; background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .video video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9;
-    max-height: 320px; object-fit: contain; background: #000; }
+  /* The frame is painted to a canvas rather than shown from the video element:
+     hardware-decoded video can composite as black on some machines, and drawImage
+     reads the decoded frame directly, bypassing that path entirely. */
+  .vstage { position: relative; width: 100%; aspect-ratio: 16 / 9; max-height: 320px; background: #000; }
+  .video video { position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: #000; }
+  .video canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   .vdiag { padding: 4px 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--muted); background: #12151c; border-top: 1px solid var(--line);
     user-select: all; word-break: break-word; }
-  .vhud { position: absolute; left: 8px; bottom: 44px; display: flex; gap: 10px;
+  .vhud { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 10px; z-index: 2;
     font: 600 15px/1 system-ui, sans-serif; color: #fff; text-shadow: 0 1px 4px #000; font-variant-numeric: tabular-nums; }
   .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px 2px;
     position: relative; height: 180px; }
@@ -347,7 +352,7 @@ function detectLaps(rows, sf) {
 
 /* ---------- app state ---------- */
 const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
-  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null, vidTimer: 0, vidPoll: 0 };
+  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null, vidTimer: 0, vidPoll: 0, vidRaf: 0, vidPainted: false };
 try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
 try { if (localStorage.getItem('vbo.colorBy') === 'lap') S.colorBy = 'lap'; } catch (e) {}
 let savedRate = 1;
@@ -431,7 +436,8 @@ function build(parsed, name) {
   document.getElementById('fileName').textContent = `${name} · ${parsed.unit || 'VBOX'} · ${parsed.created}`;
   // a video loaded against the previous log no longer lines up
   if (S.vidUrl) { URL.revokeObjectURL(S.vidUrl); S.vidUrl = null; }
-  S.video = null; S.videoReady = false; S.videoSync = false;
+  S.video = null; S.videoReady = false; S.videoSync = false; S.vidPainted = false;
+  cancelAnimationFrame(S.vidRaf); clearInterval(S.vidPoll);
   S.fpv = false; FPV.map = null; FPV.line = null; Mini.map = null; Mini.line = null;
   document.getElementById('vidName').textContent = '';
   document.getElementById('vidFile').value = '';
@@ -489,7 +495,7 @@ function build(parsed, name) {
         <div class="vhud"><span id="fhudSpeed"></span><span id="fhudG"></span></div>
       </div>
       <div class="video" id="videoWrap" hidden>
-        <video id="video" playsinline muted controls preload="auto"></video>
+        <div class="vstage"><video id="video" playsinline muted preload="auto"></video><canvas id="vcanvas"></canvas></div>
         <div class="vdiag" id="vdiag" hidden></div>
         <div class="vhud"><span id="vhudSpeed"></span><span id="vhudG"></span></div>
       </div>
@@ -737,6 +743,28 @@ function codecSupport() {
 
 const codecProbe = type => document.createElement('video').canPlayType(type) || 'no';
 
+function paintVideoFrame() {
+  const v = S.video, c = document.getElementById('vcanvas');
+  if (!v || !c || v.readyState < 2 || !v.videoWidth) return;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const s = Math.min(w / v.videoWidth, h / v.videoHeight);
+  const dw = v.videoWidth * s, dh = v.videoHeight * s;
+  ctx.drawImage(v, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  S.vidPainted = true;
+}
+
+function startVideoPaint() {
+  cancelAnimationFrame(S.vidRaf);
+  const step = () => { paintVideoFrame(); S.vidRaf = requestAnimationFrame(step); };
+  step();
+}
+
 function updateVidDiag() {
   const el = document.getElementById('vdiag'), v = S.video;
   if (!el || !v) return;
@@ -744,8 +772,9 @@ function updateVidDiag() {
   if (v.getVideoPlaybackQuality) {
     const q = v.getVideoPlaybackQuality();
     frames = `${q.totalVideoFrames} decoded, ${q.droppedVideoFrames} dropped`;
-    painted = q.totalVideoFrames > 0;
+    painted = q.totalVideoFrames > 0 || S.vidPainted;
   }
+  frames += S.vidPainted ? ', canvas painting' : ', canvas idle';
   // Metadata alone is not success: a video can report a size and duration while
   // never painting a frame, so the readout stays up until one is actually decoded.
   el.hidden = S.videoReady && !v.error && v.videoWidth > 0 && painted;
@@ -794,7 +823,8 @@ function loadVideos(files) {
   const rows = S.data.rows;
   if (rows[0].avi === null) { alert('This log has no avitime column, so video cannot be synced.'); return; }
   const v = document.getElementById('video');
-  S.video = v; S.videoReady = false; S.videoSync = false;
+  S.video = v; S.videoReady = false; S.videoSync = false; S.vidPainted = false;
+  cancelAnimationFrame(S.vidRaf);
   S.vidType = files[0].type || 'unknown';
   if (S.vidUrl) URL.revokeObjectURL(S.vidUrl);
   S.vidUrl = URL.createObjectURL(files[0]);
@@ -822,6 +852,7 @@ function loadVideos(files) {
     // painting nothing, so wait until there is decoded data to seek from.
     if (v.readyState >= 2) seekIndex(S.cursor);
     else v.addEventListener('loadeddata', () => seekIndex(S.cursor), { once: true });
+    startVideoPaint();
   };
   v.onerror = () => reportVideoError(files[0], v);
   for (const ev of ['loadeddata', 'canplay', 'timeupdate', 'stalled', 'suspend', 'waiting', 'playing', 'seeked', 'pause'])
