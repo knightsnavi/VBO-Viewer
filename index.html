@@ -347,7 +347,7 @@ function detectLaps(rows, sf) {
 
 /* ---------- app state ---------- */
 const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
-  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null, vidTimer: 0 };
+  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null, vidTimer: 0, vidPoll: 0 };
 try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
 try { if (localStorage.getItem('vbo.colorBy') === 'lap') S.colorBy = 'lap'; } catch (e) {}
 let savedRate = 1;
@@ -740,14 +740,16 @@ const codecProbe = type => document.createElement('video').canPlayType(type) || 
 function updateVidDiag() {
   const el = document.getElementById('vdiag'), v = S.video;
   if (!el || !v) return;
-  // the readout is noise once a video is playing; it earns its place only on failure
-  el.hidden = S.videoReady && !v.error && v.videoWidth > 0;
-  if (el.hidden) return;
-  let frames = 'n/a';
+  let frames = 'n/a', painted = true;
   if (v.getVideoPlaybackQuality) {
     const q = v.getVideoPlaybackQuality();
     frames = `${q.totalVideoFrames} decoded, ${q.droppedVideoFrames} dropped`;
+    painted = q.totalVideoFrames > 0;
   }
+  // Metadata alone is not success: a video can report a size and duration while
+  // never painting a frame, so the readout stays up until one is actually decoded.
+  el.hidden = S.videoReady && !v.error && v.videoWidth > 0 && painted;
+  if (el.hidden) return;
   el.textContent = [
     `type ${S.vidType || 'unknown'}`,
     `readyState ${v.readyState}`,
@@ -816,11 +818,16 @@ function loadVideos(files) {
           : ` — does not overlap this log (log starts at ${fmtLap(s)} of the recording)`);
     label.style.color = S.videoSync ? 'var(--good)' : 'var(--warn)';
     v.playbackRate = Play.rate;
-    seekIndex(S.cursor);
+    // Seeking before the first frame exists can leave a large file stuck mid-seek,
+    // painting nothing, so wait until there is decoded data to seek from.
+    if (v.readyState >= 2) seekIndex(S.cursor);
+    else v.addEventListener('loadeddata', () => seekIndex(S.cursor), { once: true });
   };
   v.onerror = () => reportVideoError(files[0], v);
   for (const ev of ['loadeddata', 'canplay', 'timeupdate', 'stalled', 'suspend', 'waiting', 'playing', 'seeked', 'pause'])
     v.addEventListener(ev, updateVidDiag);
+  clearInterval(S.vidPoll);
+  S.vidPoll = setInterval(updateVidDiag, 1000);
   // some browsers neither load nor fire an error on a codec they half-recognise
   clearTimeout(S.vidTimer);
   S.vidTimer = setTimeout(() => { if (!S.videoReady) reportVideoError(files[0], v); }, 10000);
