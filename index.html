@@ -131,8 +131,11 @@
       rgba(29,59,87,.3) 26%, rgba(29,59,87,0) 40%); }
   .fpv-credit { position: absolute; right: 6px; top: 4px; font-size: 10px; color: rgba(255,255,255,.5); }
   .video { position: relative; background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .video video { display: block; width: 100%; max-height: 320px; background: #000; }
-  .vhud { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 10px;
+  .video video { display: block; width: 100%; min-height: 40px; max-height: 320px; background: #000; }
+  .vdiag { padding: 4px 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--muted); background: #12151c; border-top: 1px solid var(--line);
+    user-select: all; word-break: break-word; }
+  .vhud { position: absolute; left: 8px; bottom: 60px; display: flex; gap: 10px;
     font: 600 15px/1 system-ui, sans-serif; color: #fff; text-shadow: 0 1px 4px #000; font-variant-numeric: tabular-nums; }
   .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px 2px;
     position: relative; height: 180px; }
@@ -485,7 +488,8 @@ function build(parsed, name) {
         <div class="vhud"><span id="fhudSpeed"></span><span id="fhudG"></span></div>
       </div>
       <div class="video" id="videoWrap" hidden>
-        <video id="video" playsinline muted preload="auto"></video>
+        <video id="video" playsinline muted controls preload="auto"></video>
+        <div class="vdiag" id="vdiag"></div>
         <div class="vhud"><span id="vhudSpeed"></span><span id="vhudG"></span></div>
       </div>
       <div class="chart"><canvas id="cSpeed"></canvas></div>
@@ -710,6 +714,8 @@ function videoTimeToSessionT(vt) {
   return rows[lo].t;
 }
 
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
 function showNotice(html) {
   document.getElementById('noticeText').innerHTML = html;
   document.getElementById('notice').hidden = false;
@@ -728,23 +734,45 @@ function codecSupport() {
     .join(', ');
 }
 
-function reportVideoError(file, v) {
-  const why = {
-    1: 'loading was aborted',
-    2: 'a network error interrupted it',
-    3: 'the browser could not decode it',
-    4: 'this browser has no decoder for its format',
-  }[v.error && v.error.code] || 'it did not load in time';
-  document.getElementById('videoWrap').hidden = true;
+function updateVidDiag() {
+  const el = document.getElementById('vdiag'), v = S.video;
+  if (!el || !v) return;
+  let frames = 'n/a';
+  if (v.getVideoPlaybackQuality) {
+    const q = v.getVideoPlaybackQuality();
+    frames = `${q.totalVideoFrames} decoded, ${q.droppedVideoFrames} dropped`;
+  }
+  el.textContent = [
+    `type ${S.vidType || 'unknown'}`,
+    `readyState ${v.readyState}`,
+    `picture ${v.videoWidth}x${v.videoHeight}`,
+    `duration ${isFinite(v.duration) ? v.duration.toFixed(1) + 's' : 'unknown'}`,
+    `frames ${frames}`,
+    v.error ? `ERROR ${v.error.code}` : 'no error',
+  ].join(' · ');
+}
+
+function reportVideoError(file, v, noPicture) {
+  const why = noPicture
+    ? 'the container loaded but carries no picture this browser can decode'
+    : ({
+        1: 'loading was aborted',
+        2: 'a network error interrupted it',
+        3: 'the browser could not decode it',
+        4: 'this browser has no decoder for its format',
+      }[v.error && v.error.code] || 'it did not load in time');
   S.videoReady = false; S.videoSync = false;
+  // keep the panel up even on a hard failure, so the diagnostics stay readable
+  document.getElementById('videoWrap').hidden = false;
+  updateVidDiag();
   document.getElementById('vidName').textContent = 'video not playable here';
   document.getElementById('vidName').style.color = 'var(--warn)';
   showNotice(
-    `<b>${file.name}</b> did not play — ${why}. ` +
+    `<b>${esc(file.name)}</b> did not play — ${why}. ` +
     `Chrome often cannot decode H.265/HEVC, while Safari and iPhones reliably can, so a file that plays on your phone may fail here. ` +
     `This browser reports ${codecSupport()}. ` +
     `Try opening this page in Safari, or convert the file once with ffmpeg: ` +
-    `<code>ffmpeg -i "${file.name}" -c:v libx264 -crf 20 -pix_fmt yuv420p -c:a aac out.mp4</code> ` +
+    `<code>ffmpeg -i "${esc(file.name)}" -c:v libx264 -crf 20 -pix_fmt yuv420p -c:a aac out.mp4</code> ` +
     `— the converted file keeps the same timing, so it stays in sync.`);
 }
 
@@ -755,13 +783,18 @@ function loadVideos(files) {
   if (rows[0].avi === null) { alert('This log has no avitime column, so video cannot be synced.'); return; }
   const v = document.getElementById('video');
   S.video = v; S.videoReady = false; S.videoSync = false;
+  S.vidType = files[0].type || 'unknown';
   if (S.vidUrl) URL.revokeObjectURL(S.vidUrl);
   S.vidUrl = URL.createObjectURL(files[0]);
   v.src = S.vidUrl;
   v.onloadedmetadata = () => {
     clearTimeout(S.vidTimer);
-    S.videoReady = true;
     document.getElementById('videoWrap').hidden = false;
+    updateVidDiag();
+    // Chrome can parse an HEVC container and report a duration while decoding no
+    // picture at all, which shows up only as a zero-sized video track.
+    if (!v.videoWidth || !v.videoHeight) { reportVideoError(files[0], v, true); return; }
+    S.videoReady = true;
     const [s, e] = videoSpan();
     // avitime says where in the recording this log sits; a clip that stops short cannot drive the clock
     S.videoSync = v.duration >= s + 1;
@@ -776,6 +809,8 @@ function loadVideos(files) {
     seekIndex(S.cursor);
   };
   v.onerror = () => reportVideoError(files[0], v);
+  for (const ev of ['loadeddata', 'canplay', 'timeupdate', 'stalled', 'suspend', 'waiting', 'playing'])
+    v.addEventListener(ev, updateVidDiag);
   // some browsers neither load nor fire an error on a codec they half-recognise
   clearTimeout(S.vidTimer);
   S.vidTimer = setTimeout(() => { if (!S.videoReady) reportVideoError(files[0], v); }, 10000);
