@@ -27,6 +27,13 @@
     border: 3px dashed var(--accent); }
   #drop.on { display: grid; }
 
+  .notice { display: flex; gap: 12px; align-items: flex-start; margin: 10px 16px 0; padding: 10px 12px;
+    border: 1px solid var(--warn); border-radius: 8px; background: #2a2318; color: var(--text);
+    font-size: 13px; line-height: 1.5; }
+  .notice span { flex: 1; }
+  .notice code { background: #14181f; padding: 1px 5px; border-radius: 4px; user-select: all;
+    font-size: 12px; word-break: break-all; }
+  .notice button { flex: none; align-self: center; }
   main { display: grid; grid-template-columns: minmax(320px, 5fr) minmax(360px, 6fr);
     grid-template-rows: auto 1fr; gap: 12px; padding: 12px 16px 16px; min-height: calc(100% - 55px); }
   .stats { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -150,6 +157,7 @@
   <span id="fileName">No file loaded — drop a .vbo anywhere</span>
 </header>
 <div id="drop">Drop your .vbo file</div>
+<div class="notice" id="notice" hidden><span id="noticeText"></span><button class="btn" id="noticeX">Dismiss</button></div>
 
 <main id="main">
   <div class="empty" id="empty">
@@ -333,7 +341,7 @@ function detectLaps(rows, sf) {
 
 /* ---------- app state ---------- */
 const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
-  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null };
+  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null, vidTimer: 0 };
 try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
 try { if (localStorage.getItem('vbo.colorBy') === 'lap') S.colorBy = 'lap'; } catch (e) {}
 let savedRate = 1;
@@ -700,6 +708,44 @@ function videoTimeToSessionT(vt) {
   return rows[lo].t;
 }
 
+function showNotice(html) {
+  document.getElementById('noticeText').innerHTML = html;
+  document.getElementById('notice').hidden = false;
+}
+
+// Codec support differs sharply between browsers: Safari decodes HEVC, Chrome on
+// macOS generally will not, which is why the same file can play on a phone only.
+function codecSupport() {
+  const v = document.createElement('video');
+  const probe = {
+    'H.264': 'video/mp4; codecs="avc1.42E01E"',
+    'HEVC/H.265': 'video/mp4; codecs="hvc1.1.6.L93.B0"',
+  };
+  return Object.entries(probe)
+    .map(([name, type]) => `${name}: ${v.canPlayType(type) || 'no'}`)
+    .join(', ');
+}
+
+function reportVideoError(file, v) {
+  const why = {
+    1: 'loading was aborted',
+    2: 'a network error interrupted it',
+    3: 'the browser could not decode it',
+    4: 'this browser has no decoder for its format',
+  }[v.error && v.error.code] || 'it did not load in time';
+  document.getElementById('videoWrap').hidden = true;
+  S.videoReady = false; S.videoSync = false;
+  document.getElementById('vidName').textContent = 'video not playable here';
+  document.getElementById('vidName').style.color = 'var(--warn)';
+  showNotice(
+    `<b>${file.name}</b> did not play — ${why}. ` +
+    `Chrome often cannot decode H.265/HEVC, while Safari and iPhones reliably can, so a file that plays on your phone may fail here. ` +
+    `This browser reports ${codecSupport()}. ` +
+    `Try opening this page in Safari, or convert the file once with ffmpeg: ` +
+    `<code>ffmpeg -i "${file.name}" -c:v libx264 -crf 20 -pix_fmt yuv420p -c:a aac out.mp4</code> ` +
+    `— the converted file keeps the same timing, so it stays in sync.`);
+}
+
 function loadVideos(files) {
   if (!files.length) return;
   files.sort((x, y) => x.name.localeCompare(y.name));
@@ -711,6 +757,7 @@ function loadVideos(files) {
   S.vidUrl = URL.createObjectURL(files[0]);
   v.src = S.vidUrl;
   v.onloadedmetadata = () => {
+    clearTimeout(S.vidTimer);
     S.videoReady = true;
     document.getElementById('videoWrap').hidden = false;
     const [s, e] = videoSpan();
@@ -726,7 +773,10 @@ function loadVideos(files) {
     v.playbackRate = Play.rate;
     seekIndex(S.cursor);
   };
-  v.onerror = () => alert('Could not play that video file in this browser.');
+  v.onerror = () => reportVideoError(files[0], v);
+  // some browsers neither load nor fire an error on a codec they half-recognise
+  clearTimeout(S.vidTimer);
+  S.vidTimer = setTimeout(() => { if (!S.videoReady) reportVideoError(files[0], v); }, 10000);
 }
 
 function range() {
@@ -1040,6 +1090,7 @@ window.addEventListener('keydown', e => {
 document.querySelectorAll('#units button').forEach(b => b.onclick = () => setUnits(b.dataset.u));
 setUnits(S.units);
 
+document.getElementById('noticeX').onclick = () => { document.getElementById('notice').hidden = true; };
 document.getElementById('file').onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
 document.getElementById('vidFile').onchange = e => {
   if (!S.data) { alert('Open a .vbo log first — the video syncs to its data.'); e.target.value = ''; return; }
