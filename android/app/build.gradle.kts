@@ -10,8 +10,8 @@ android {
         applicationId = "com.knightsnavi.vboviewer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildTypes {
@@ -31,6 +31,11 @@ android {
     buildFeatures {
         buildConfig = true
     }
+}
+
+dependencies {
+    // for window insets, so the app clears the status and navigation bars
+    implementation("androidx.core:core:1.13.1")
 }
 
 // The web app is the single source of truth: its files are copied into assets at

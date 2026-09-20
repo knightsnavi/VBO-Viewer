@@ -11,6 +11,10 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+
 public class MainActivity extends Activity {
 
     private static final int FILE_REQUEST = 1;
@@ -25,7 +29,19 @@ public class MainActivity extends Activity {
         web = new WebView(this);
         web.setLayoutParams(new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        // matches the page background, so the inset strips do not flash white
+        web.setBackgroundColor(0xFF0F1115);
         setContentView(web);
+
+        // Android 15 forces apps targeting SDK 35 to draw edge to edge, which puts the
+        // page under the status bar and the system navigation bar. Inset by the bars
+        // instead: this also re-applies on fold and unfold, where the cutouts differ.
+        ViewCompat.setOnApplyWindowInsetsListener(web, (view, windowInsets) -> {
+            Insets bars = windowInsets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return WindowInsetsCompat.CONSUMED;
+        });
 
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
