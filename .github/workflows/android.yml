@@ -1,0 +1,60 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - 'vendor/**'
+      - 'sample/**'
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Stage the APK
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk out/vbo-viewer.apk
+          ls -lh out/
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vbo-viewer-apk
+          path: out/vbo-viewer.apk
+
+      # Published to a fixed tag so the phone can always fetch the same URL:
+      # https://github.com/${{ github.repository }}/releases/latest/download/vbo-viewer.apk
+      - name: Publish to the apk release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view apk >/dev/null 2>&1 || \
+            gh release create apk --title "VBO Viewer APK" \
+              --notes "Latest build of the VBO Viewer Android app. Debug-signed for sideloading."
+          gh release upload apk out/vbo-viewer.apk --clobber
