@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.ViewGroup;
+import android.widget.FrameLayout;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -13,6 +14,7 @@ import android.webkit.WebViewClient;
 
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 public class MainActivity extends Activity {
@@ -26,17 +28,25 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
 
-        web = new WebView(this);
-        web.setLayoutParams(new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        // matches the page background, so the inset strips do not flash white
-        web.setBackgroundColor(0xFF0F1115);
-        setContentView(web);
+        // Raw insets have to reach the content view; otherwise the decor reports them
+        // as already consumed and the listener below sees zeroes.
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
 
-        // Android 15 forces apps targeting SDK 35 to draw edge to edge, which puts the
-        // page under the status bar and the system navigation bar. Inset by the bars
-        // instead: this also re-applies on fold and unfold, where the cutouts differ.
-        ViewCompat.setOnApplyWindowInsetsListener(web, (view, windowInsets) -> {
+        web = new WebView(this);
+        web.setBackgroundColor(0xFF0F1115);
+
+        // The WebView draws into its own surface and does not reliably honour its own
+        // padding, so the insets are applied to a container around it instead.
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0xFF0F1115);
+        root.addView(web, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(root);
+
+        // Android 15 onwards draws apps edge to edge, putting the page under the status
+        // bar and the navigation bar. Inset by the bars and cutout instead; this
+        // re-applies on fold and unfold, where the geometry differs.
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, windowInsets) -> {
             Insets bars = windowInsets.getInsets(
                     WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
