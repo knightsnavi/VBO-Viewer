@@ -5,39 +5,65 @@ on:
     branches: [main]
     paths:
       - 'index.html'
+      - 'app.js'
+      - 'app.css'
       - 'vendor/**'
       - 'sample/**'
       - 'android/**'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
-permissions:
-  contents: write
+# Nothing by default; each job asks only for what it needs.
+permissions: {}
+
+# Queue rather than cancel: cancelling a publish midway could leave the release
+# with its old APK deleted and no new one uploaded.
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # Its default package set includes the long-removed "tools" package,
-          # which fails the step; install what this build needs explicitly below.
-          packages: ''
-
+      # The runner image already ships the Android SDK, so no third-party action
+      # runs here beside the signing secrets.
       - name: Install SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          sdkmanager=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)
+          yes | "$sdkmanager" --licenses > /dev/null
+          "$sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Load the release signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+            echo "SIGNING_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No SIGNING_KEYSTORE_BASE64 secret, so this APK is signed with a throwaway debug key and cannot upgrade an existing install."
+          fi
 
       - name: Build release APK
         working-directory: android
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Stage the APK
@@ -46,19 +72,33 @@ jobs:
           cp android/app/build/outputs/apk/release/app-release.apk out/vbo-viewer.apk
           ls -lh out/
 
-      - name: Upload as workflow artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: vbo-viewer-apk
           path: out/vbo-viewer.apk
+          if-no-files-found: error
 
-      # Published to a fixed tag so the phone can always fetch the same URL:
-      # https://github.com/${{ github.repository }}/releases/latest/download/vbo-viewer.apk
+  # Publishing is the only step that needs write access, so it runs on its own:
+  # none of the build tooling above ever holds a token that can modify the repo.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: vbo-viewer-apk
+
+      # A fixed tag gives the phone a stable URL:
+      # https://github.com/<owner>/<repo>/releases/latest/download/vbo-viewer.apk
       - name: Publish to the apk release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view apk >/dev/null 2>&1 || \
             gh release create apk --title "VBO Viewer APK" \
-              --notes "Latest build of the VBO Viewer Android app. Debug-signed for sideloading."
-          gh release upload apk out/vbo-viewer.apk --clobber
+              --notes "Latest build of the VBO Viewer Android app, for sideloading."
+          gh release upload apk vbo-viewer.apk --clobber

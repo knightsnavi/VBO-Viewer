@@ -1,0 +1,1038 @@
+'use strict';
+
+// Math.max(...arr) passes every element as an argument and overflows the call
+// stack past ~150k items: a 25-minute log at 100 Hz. Reduce in a loop instead.
+function maxOf(arr, f) {
+  let m = -Infinity;
+  for (const x of arr) { const v = f(x); if (v > m) m = v; }
+  return m;
+}
+function minOf(arr, f) {
+  let m = Infinity;
+  for (const x of arr) { const v = f(x); if (v < m) m = v; }
+  return m;
+}
+
+// Colours are applied through the CSSOM, which the Content-Security-Policy
+// permits, rather than as style="" attributes in markup, which it blocks.
+function paintSwatches(root) {
+  root.querySelectorAll('[data-color]').forEach(el => { el.style.background = el.dataset.color; });
+}
+
+/* ---------- parsing ---------- */
+function parseVBO(text) {
+  // section names come from the file, so keep them off Object.prototype
+  const sections = Object.create(null);
+  let cur = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    const m = line.match(/^\[(.+)\]$/);
+    if (m) { cur = m[1].toLowerCase(); sections[cur] = []; continue; }
+    if (cur && line) sections[cur].push(line);
+  }
+  const cols = (sections['column names'] || [])[0]?.split(/\s+/) || (sections.header || []).map(h => h.split(' ')[0]);
+  const idx = name => cols.findIndex(c => c.toLowerCase() === name);
+  const iTime = idx('time'), iLat = idx('lat'), iLon = idx('long'), iVel = idx('velocity'),
+        iHdg = idx('heading'), iH = idx('height'), iSats = idx('sats'), iAvi = idx('avitime');
+  if (iTime < 0 || iLat < 0 || iLon < 0 || iVel < 0) throw new Error('Missing required columns (time/lat/long/velocity)');
+
+  const rows = [];
+  for (const line of sections.data || []) {
+    const p = line.split(/\s+/);
+    if (p.length < cols.length) continue;
+    rows.push({
+      tod: hhmmss(p[iTime]),
+      lat: +p[iLat] / 60,
+      lon: -(+p[iLon]) / 60,     // VBOX convention: positive longitude = West
+      v: +p[iVel],               // km/h
+      hdg: iHdg >= 0 ? +p[iHdg] : 0,
+      h: iH >= 0 ? +p[iH] : 0,
+      sats: iSats >= 0 ? +p[iSats] : 0,
+      avi: iAvi >= 0 ? +p[iAvi] : null,
+    });
+  }
+  if (rows.length < 2) throw new Error('No data rows found');
+
+  // elapsed time, handling midnight rollover
+  let off = 0, prev = rows[0].tod;
+  for (const r of rows) {
+    if (r.tod < prev - 43200) off += 86400;
+    r.t = r.tod + off - rows[0].tod;
+    prev = r.tod;
+  }
+
+  // start/finish line: "Start +long1 +lat1 +long2 +lat2 ¬ name"
+  let sf = null;
+  for (const l of sections.laptiming || []) {
+    const m = l.match(/^Start\s+([+-][\d.]+)\s+([+-][\d.]+)\s+([+-][\d.]+)\s+([+-][\d.]+)/i);
+    if (m) sf = { a: { lon: -m[1] / 60, lat: +m[2] / 60 }, b: { lon: -m[3] / 60, lat: +m[4] / 60 } };
+  }
+
+  const created = (text.match(/File created on (.+)/) || [])[1] || '';
+  const unit = (sections.comments || []).find(l => /^Type/.test(l))?.replace(/^Type\s*:\s*/, '') || '';
+  return { rows, sf, created, unit, cols };
+}
+
+function hhmmss(s) {
+  const f = parseFloat(s);
+  const hh = Math.floor(f / 10000), mm = Math.floor((f % 10000) / 100), ss = f % 100;
+  return hh * 3600 + mm * 60 + ss;
+}
+
+/* ---------- derived channels ---------- */
+function derive(rows) {
+  const n = rows.length;
+  const R = 6371000;
+  const lat0 = rows[0].lat * Math.PI / 180;
+  // local flat projection (meters) for distance & geometry
+  for (const r of rows) {
+    r.x = (r.lon * Math.PI / 180) * Math.cos(lat0) * R;
+    r.y = (r.lat * Math.PI / 180) * R;
+  }
+  rows[0].d = 0;
+  for (let i = 1; i < n; i++) rows[i].d = rows[i - 1].d + Math.hypot(rows[i].x - rows[i - 1].x, rows[i].y - rows[i - 1].y);
+
+  const v = rows.map(r => r.v / 3.6);
+  const vs = smooth(v, 5);
+  const hd = rows.map(r => r.hdg);
+  for (let i = 0; i < n; i++) {
+    const a = Math.max(0, i - 2), b = Math.min(n - 1, i + 2);
+    const dt = rows[b].t - rows[a].t || 1;
+    rows[i].gx = (vs[b] - vs[a]) / dt / 9.81;
+    let dh = hd[b] - hd[a];
+    while (dh > 180) dh -= 360;
+    while (dh < -180) dh += 360;
+    rows[i].gy = vs[i] * (dh * Math.PI / 180) / dt / 9.81;
+  }
+  const gxs = smooth(rows.map(r => r.gx), 5), gys = smooth(rows.map(r => r.gy), 5);
+  rows.forEach((r, i) => { r.gx = gxs[i]; r.gy = gys[i]; });
+
+  // GPS heading is noisy and meaningless when crawling, so smooth it as a
+  // speed-weighted vector — a plain average would tear across the 360/0 wrap.
+  const w = rows.map(r => Math.max(r.v, 1));
+  const hx = smooth(rows.map((r, i) => Math.sin(r.hdg * Math.PI / 180) * w[i]), 9);
+  const hy = smooth(rows.map((r, i) => Math.cos(r.hdg * Math.PI / 180) * w[i]), 9);
+  rows.forEach((r, i) => { r.hdgS = (Math.atan2(hx[i], hy[i]) * 180 / Math.PI + 360) % 360; });
+}
+
+function smooth(a, w) {
+  const h = Math.floor(w / 2), out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) {
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i - h); j <= Math.min(a.length - 1, i + h); j++) { s += a[j]; c++; }
+    out[i] = s / c;
+  }
+  return out;
+}
+
+/* ---------- lap detection ---------- */
+function segIntersect(p, q, a, b) {
+  const d1x = q.x - p.x, d1y = q.y - p.y, d2x = b.x - a.x, d2y = b.y - a.y;
+  const den = d1x * d2y - d1y * d2x;
+  if (Math.abs(den) < 1e-12) return null;
+  const t = ((a.x - p.x) * d2y - (a.y - p.y) * d2x) / den;
+  const u = ((a.x - p.x) * d1y - (a.y - p.y) * d1x) / den;
+  return (t >= 0 && t <= 1 && u >= 0 && u <= 1) ? t : null;
+}
+
+const GATE_WIDTH = 50; // metres
+
+// The two [laptiming] points anchor the gate; the gate itself is laid across the
+// track, perpendicular to the direction of travel at the nearest logged point.
+function gateEnds(rows, sf) {
+  const R = 6371000, lat0 = rows[0].lat * Math.PI / 180;
+  const P = p => ({ x: (p.lon * Math.PI / 180) * Math.cos(lat0) * R, y: (p.lat * Math.PI / 180) * R });
+  const a = P(sf.a), b = P(sf.b);
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  let near = rows[0], nd = Infinity;
+  for (const r of rows) { const d = (r.x - mx) ** 2 + (r.y - my) ** 2; if (d < nd) { nd = d; near = r; } }
+  const th = near.hdg * Math.PI / 180, h = GATE_WIDTH / 2;
+  const dx = Math.cos(th) * h, dy = -Math.sin(th) * h;
+  return [{ x: mx - dx, y: my - dy }, { x: mx + dx, y: my + dy }];
+}
+
+function gateLatLng(rows, sf) {
+  const R = 6371000, lat0 = rows[0].lat * Math.PI / 180;
+  return gateEnds(rows, sf).map(p => [p.y / R * 180 / Math.PI, p.x / (R * Math.cos(lat0)) * 180 / Math.PI]);
+}
+
+function detectLaps(rows, sf) {
+  if (!sf) return [];
+  const [a, b] = gateEnds(rows, sf);
+  const crossings = [];
+  for (let i = 0; i < rows.length - 1; i++) {
+    const t = segIntersect(rows[i], rows[i + 1], a, b);
+    if (t === null) continue;
+    const time = rows[i].t + t * (rows[i + 1].t - rows[i].t);
+    if (crossings.length && time - crossings[crossings.length - 1].time < 5) continue;
+    crossings.push({ time, i: i + 1 });
+  }
+  const laps = [];
+  const mk = (label, t0, t1, i0, i1, partial) => {
+    const seg = rows.slice(i0, i1 + 1);
+    if (seg.length < 2) return;
+    laps.push({
+      label, t0, t1, i0, i1, partial, time: t1 - t0,
+      max: maxOf(seg, r => r.v),
+      avg: (seg[seg.length - 1].d - seg[0].d) / (t1 - t0) * 3.6,
+      dist: seg[seg.length - 1].d - seg[0].d,
+      maxGy: maxOf(seg, r => Math.abs(r.gy)),
+    });
+  };
+  if (crossings.length) {
+    mk('Out', rows[0].t, crossings[0].time, 0, crossings[0].i, true);
+    for (let k = 0; k < crossings.length - 1; k++)
+      mk(String(k + 1), crossings[k].time, crossings[k + 1].time, crossings[k].i, crossings[k + 1].i, false);
+    const last = crossings[crossings.length - 1];
+    mk('In', last.time, rows[rows.length - 1].t, last.i, rows.length - 1, true);
+  }
+  return laps;
+}
+
+/* ---------- app state ---------- */
+const S = { data: null, laps: [], sel: null, cursor: 0, xMode: 'time', map: null, charts: [], layers: [], marker: null, units: 'metric',
+  colorBy: 'speed', chase: false, fpv: false, video: null, videoReady: false, videoSync: false, vidUrl: null, vidTimer: 0, vidPoll: 0, vidRaf: 0, vidPainted: false };
+try { if (localStorage.getItem('vbo.units') === 'imperial') S.units = 'imperial'; } catch (e) {}
+try { if (localStorage.getItem('vbo.colorBy') === 'lap') S.colorBy = 'lap'; } catch (e) {}
+let savedRate = 1;
+try { const v = +localStorage.getItem('vbo.rate'); if ([0.25, 0.5, 1, 2, 4].includes(v)) savedRate = v; } catch (e) {}
+
+const U = {
+  imp: () => S.units === 'imperial',
+  spd: v => U.imp() ? v * 0.621371 : v,          spdU: () => U.imp() ? 'mph' : 'km/h',
+  dist: m => U.imp() ? m / 1609.344 : m / 1000,  distU: () => U.imp() ? 'mi' : 'km',
+  hgt: m => U.imp() ? m * 3.28084 : m,           hgtU: () => U.imp() ? 'ft' : 'm',
+};
+
+function setUnits(u) {
+  S.units = u;
+  try { localStorage.setItem('vbo.units', u); } catch (e) {}
+  document.querySelectorAll('#units button').forEach(b => b.classList.toggle('on', b.dataset.u === u));
+  if (!S.data) return;
+  buildStats(); buildLapTable(); refreshCharts(); drawLegend(); setCursor(S.cursor);
+  document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === S.sel));
+}
+
+function fmtLap(s) {
+  const m = Math.floor(s / 60), r = s - m * 60;
+  return m ? `${m}:${r.toFixed(2).padStart(5, '0')}` : r.toFixed(2);
+}
+function fmtClock(s) {
+  const m = Math.floor(s / 60), r = Math.floor(s - m * 60);
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+// Golden-angle hue steps keep adjacent laps far apart in colour however many there are.
+function assignLapColors() {
+  let k = 0;
+  for (const l of S.laps) l.color = l.partial ? '#8b93a7' : `hsl(${(k++ * 137.508) % 360} 78% 62%)`;
+}
+
+// Contiguous runs of rows that share a lap, for drawing one polyline per lap.
+function lapRuns(a, b) {
+  const runs = [];
+  for (const l of S.laps) {
+    const i0 = Math.max(l.i0, a), i1 = Math.min(l.i1, b);
+    if (i1 > i0) runs.push({ i0, i1, color: l.color, label: l.label });
+  }
+  return runs;
+}
+
+// The racing line for the inset and fly-by: one polyline per lap when colouring
+// by lap, otherwise a single accent-coloured line.
+function traceLayer(weight, opacity) {
+  const rows = S.data.rows, [a, b] = range();
+  const pts = (i0, i1) => rows.slice(i0, i1 + 1).map(r => [r.lat, r.lon]);
+  if (S.colorBy === 'lap' && S.laps.length) {
+    return L.featureGroup(lapRuns(a, b).map(run =>
+      L.polyline(pts(run.i0, run.i1), { color: run.color, weight, opacity, interactive: false })));
+  }
+  return L.featureGroup([L.polyline(pts(a, b), { color: '#4fc3f7', weight, opacity, interactive: false })]);
+}
+
+function setColorBy(c) {
+  S.colorBy = c;
+  try { localStorage.setItem('vbo.colorBy', c); } catch (e) {}
+  document.querySelectorAll('#colorBy button').forEach(b => b.classList.toggle('on', b.dataset.c === c));
+  if (!S.data) return;
+  drawTrack(); drawLegend(); buildLapTable(); drawMiniLine();
+  if (S.fpv && FPV.map) drawFPVLine();
+  document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === S.sel));
+}
+
+function speedColor(f) {
+  const stops = [[59,91,219],[34,184,207],[81,207,102],[252,196,25],[255,107,107]];
+  const p = Math.min(Math.max(f, 0), 0.9999) * (stops.length - 1), i = Math.floor(p), k = p - i;
+  const c = stops[i].map((a, j) => Math.round(a + (stops[i + 1][j] - a) * k));
+  return `rgb(${c.join(',')})`;
+}
+
+/* ---------- UI build ---------- */
+function build(parsed, name) {
+  S.data = parsed; derive(parsed.rows);
+  S.laps = detectLaps(parsed.rows, parsed.sf);
+  assignLapColors();
+  S.sel = null; S.cursor = 0;
+  document.getElementById('fileName').textContent = `${name} · ${parsed.unit || 'VBOX'} · ${parsed.created}`;
+  // a video loaded against the previous log no longer lines up
+  if (S.vidUrl) { URL.revokeObjectURL(S.vidUrl); S.vidUrl = null; }
+  S.video = null; S.videoReady = false; S.videoSync = false; S.vidPainted = false;
+  cancelAnimationFrame(S.vidRaf); clearInterval(S.vidPoll);
+  S.fpv = false; FPV.map = null; FPV.line = null; Mini.map = null; Mini.line = null;
+  document.getElementById('vidName').textContent = '';
+  document.getElementById('vidFile').value = '';
+
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div class="stats" id="stats"></div>
+    <div class="left">
+      <div id="map"></div>
+      <div class="laps">
+        <h2><span>Laps</span><span>
+          <button class="btn" id="setGate" title="Place a start/finish gate across the track at the current cursor position">Set start/finish at cursor</button>
+          <button class="btn" id="allLaps">Show whole session</button>
+          <span class="seg" id="colorBy"><button data-c="speed">Speed</button><button data-c="lap">Lap</button></span>
+          </span></h2>
+        <div class="scroll"><table>
+          <thead><tr><th>Lap</th><th>Time</th><th>Δ best</th><th id="thMax"></th><th id="thAvg"></th><th>Max lat G</th></tr></thead>
+          <tbody id="lapBody"></tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="right">
+      <div class="live">
+        <div class="readout" id="readout"></div>
+        <div class="gg" title="G-G diagram: lateral G left/right, longitudinal G up (accel) / down (braking)"><canvas id="gg"></canvas></div>
+        <div class="mini" title="Heading-up satellite inset — the track around you, rotated so you are always driving upward">
+          <div class="mini-view">
+            <div class="mini-cam" id="miniCam"><div class="mini-map" id="minimap"></div></div>
+            <div class="mini-n" id="miniN"><span>N</span></div>
+            <div class="mini-car"></div>
+          </div>
+        </div>
+      </div>
+      <div class="transport">
+        <button class="btn play" id="play" title="Play / pause (space)">▶</button>
+        <input type="range" id="scrub" min="0" max="100" value="0" step="1">
+        <span class="tcode" id="tcode">0:00</span>
+        <select id="rate" title="Playback speed">
+          <option>0.25</option><option>0.5</option><option selected>1</option><option>2</option><option>4</option>
+        </select>
+        <label class="chase"><input type="checkbox" id="chase"> Chase cam</label>
+        <label class="chase"><input type="checkbox" id="fpvOn"> Fly-by</label>
+      </div>
+      <div class="toolbar">
+        X axis:
+        <select id="xMode"><option value="time">Time</option><option value="dist">Distance</option></select>
+        <span id="viewLabel"></span>
+      </div>
+      <div class="fpv" id="fpvPanel" hidden>
+        <div class="fpv-stage">
+          <div class="fpv-cam" id="fpvCam"><div class="fpv-map" id="fpvmap"></div></div>
+          <div class="fpv-haze"></div>
+          <div class="fpv-credit">Imagery &copy; Esri</div>
+        </div>
+        <div class="vhud"><span id="fhudSpeed"></span><span id="fhudG"></span></div>
+      </div>
+      <div class="video" id="videoWrap" hidden>
+        <div class="vstage"><video id="video" playsinline muted preload="auto"></video><canvas id="vcanvas"></canvas></div>
+        <div class="vdiag" id="vdiag" hidden></div>
+        <div class="vhud"><span id="vhudSpeed"></span><span id="vhudG"></span></div>
+      </div>
+      <div class="chart"><canvas id="cSpeed"></canvas></div>
+      <div class="chart"><canvas id="cG"></canvas></div>
+      <div class="chart"><canvas id="cAlt"></canvas></div>
+    </div>`;
+
+  document.getElementById('allLaps').onclick = () => selectLap(null);
+  document.getElementById('setGate').onclick = setGateAtCursor;
+  document.getElementById('xMode').onchange = e => { S.xMode = e.target.value; refreshCharts(); };
+  document.querySelectorAll('#colorBy button').forEach(btn => btn.onclick = () => setColorBy(btn.dataset.c));
+  document.querySelectorAll('#colorBy button').forEach(b => b.classList.toggle('on', b.dataset.c === S.colorBy));
+
+  buildMap(); buildCharts(); buildLapTable(); buildTransport(); selectLap(null);
+}
+
+/* ---------- playback ---------- */
+function buildTransport() {
+  const play = document.getElementById('play'), scrub = document.getElementById('scrub');
+  play.onclick = () => Play.toggle();
+  scrub.oninput = () => { Play.pause(); seekIndex(+scrub.value); };
+  const rate = document.getElementById('rate');
+  rate.value = String(Play.rate);
+  rate.onchange = e => {
+    Play.setRate(+e.target.value);
+    try { localStorage.setItem('vbo.rate', e.target.value); } catch (err) {}
+  };
+  document.getElementById('fpvOn').onchange = e => toggleFPV(e.target.checked);
+  document.getElementById('chase').onchange = e => {
+    S.chase = e.target.checked;
+    if (!S.chase) drawTrack(); else followCar();
+  };
+}
+
+const Play = {
+  on: false, rate: savedRate, raf: 0, last: 0, t: 0,
+  toggle() { this.on ? this.pause() : this.start(); },
+  start() {
+    const [a, b] = range();
+    if (S.cursor >= b) seekIndex(a);
+    this.t = S.data.rows[S.cursor].t;
+    this.on = true;
+    document.getElementById('play').textContent = '❚❚';
+    if (S.videoSync) { S.video.playbackRate = this.rate; S.video.play().catch(() => {}); }
+    this.last = performance.now();
+    this.raf = requestAnimationFrame(t => this.tick(t));
+  },
+  pause() {
+    this.on = false;
+    document.getElementById('play').textContent = '▶';
+    cancelAnimationFrame(this.raf);
+    if (S.video) S.video.pause();
+  },
+  setRate(r) {
+    this.rate = r;
+    if (S.video) S.video.playbackRate = r;
+  },
+  tick(now) {
+    if (!this.on) return;
+    const dt = Math.min((now - this.last) / 1000, 0.25) * this.rate;
+    this.last = now;
+    const rows = S.data.rows, [a, b] = range();
+    // the video is the clock while it is playing inside the range it actually covers
+    if (S.videoSync && !S.video.paused && inVideoSpan(S.video.currentTime)) this.t = videoTimeToSessionT(S.video.currentTime);
+    else this.t += dt;
+    if (this.t >= rows[b].t) { seekIndex(b); this.pause(); return; }
+    seekIndex(indexAtTime(this.t, a, b), true);
+    this.raf = requestAnimationFrame(n => this.tick(n));
+  },
+};
+
+// hovering scrubs, but never fights the clock while a replay is running
+function hoverSeek(i, src) {
+  if (Play.on) return;
+  setCursor(i, src);
+  if (S.videoSync) {
+    const vt = sessionTToVideoTime(S.data.rows[i].t);
+    if (vt !== null && Math.abs(S.video.currentTime - vt) > 0.15) S.video.currentTime = vt;
+  }
+}
+
+function indexAtTime(t, a, b) {
+  let lo = a, hi = b;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (S.data.rows[m].t < t) lo = m + 1; else hi = m; }
+  return lo;
+}
+
+function seekIndex(i, fromClock) {
+  const [a, b] = range();
+  i = Math.min(Math.max(i, a), b);
+  setCursor(i);
+  if (!fromClock) Play.t = S.data.rows[i].t;
+  if (!fromClock && S.video && S.videoReady) {
+    const vt = sessionTToVideoTime(S.data.rows[i].t);
+    if (vt !== null && Math.abs(S.video.currentTime - vt) > 0.15) S.video.currentTime = vt;
+  }
+  if (S.chase) followCar();
+}
+
+function followCar() {
+  const r = S.data.rows[S.cursor];
+  S.map.setView([r.lat, r.lon], Math.max(S.map.getZoom(), 17), { animate: false });
+}
+
+/* ---------- fly-by view ---------- */
+// The ground is real satellite imagery: a Leaflet map tilted into the ground
+// plane with CSS 3D, rotated so the car's heading points into the screen.
+// zoom 18 rather than 19: each tile covers four times the ground, which is what
+// buys enough distance to reach the horizon without loading hundreds of tiles.
+const FPV = { tilt: 72, drop: 104, zoom: 18, ahead: 560, map: null, line: null };
+
+function toggleFPV(on) {
+  S.fpv = on;
+  document.getElementById('fpvPanel').hidden = !on;
+  if (!on) return;
+  if (!FPV.map) buildFPVMap();
+  FPV.map.invalidateSize();
+  const r = S.data.rows[S.cursor];
+  FPV.map.setView([r.lat, r.lon], FPV.zoom, { animate: false });
+  drawFPVLine();
+  drawFPV();
+}
+
+function buildFPVMap() {
+  const m = L.map('fpvmap', {
+    zoomControl: false, attributionControl: false, preferCanvas: true,
+    dragging: false, scrollWheelZoom: false, doubleClickZoom: false,
+    boxZoom: false, keyboard: false, touchZoom: false, inertia: false, fadeAnimation: false,
+  });
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 21, maxNativeZoom: 19, keepBuffer: 6,
+  }).addTo(m);
+  m.setView([S.data.rows[0].lat, S.data.rows[0].lon], FPV.zoom);
+  FPV.map = m;
+}
+
+// Pixel offset of the car from the map's centre, recentring the map only once
+// it drifts far out — panning every frame would reload tiles constantly.
+function camOffset(map, r, limit) {
+  const p = map.latLngToContainerPoint([r.lat, r.lon]);
+  const c = map.getSize().divideBy(2);
+  const dx = p.x - c.x, dy = p.y - c.y;
+  if (Math.abs(dx) > limit || Math.abs(dy) > limit) {
+    map.setView([r.lat, r.lon], map.getZoom(), { animate: false });
+    return { dx: 0, dy: 0 };
+  }
+  return { dx, dy };
+}
+
+function drawFPVLine() {
+  if (FPV.line) FPV.map.removeLayer(FPV.line);
+  FPV.line = traceLayer(6, .8).addTo(FPV.map);
+}
+
+function drawFPV() {
+  if (!S.fpv || !FPV.map) return;
+  const r = S.data.rows[S.cursor];
+  const { dx, dy } = camOffset(FPV.map, r, 220);
+  document.getElementById('fpvCam').style.transform =
+    `translateY(${FPV.drop}px) rotateX(${FPV.tilt}deg) rotate(${-r.hdgS}deg) translate(${-dx}px, ${FPV.ahead - dy}px)`;
+  document.getElementById('fhudSpeed').textContent = U.spd(r.v).toFixed(0) + ' ' + U.spdU();
+  document.getElementById('fhudG').textContent = Math.hypot(r.gx, r.gy).toFixed(2) + ' g';
+}
+
+/* ---------- heading-up satellite inset ---------- */
+const Mini = { zoom: 18, map: null, line: null };
+
+function buildMiniMap() {
+  const m = L.map('minimap', {
+    zoomControl: false, attributionControl: false, preferCanvas: true,
+    dragging: false, scrollWheelZoom: false, doubleClickZoom: false,
+    boxZoom: false, keyboard: false, touchZoom: false, inertia: false, fadeAnimation: false,
+  });
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 21, maxNativeZoom: 19, keepBuffer: 3,
+  }).addTo(m);
+  m.setView([S.data.rows[S.cursor].lat, S.data.rows[S.cursor].lon], Mini.zoom);
+  Mini.map = m;
+  drawMiniLine();
+}
+
+function drawMiniLine() {
+  if (!Mini.map) return;
+  if (Mini.line) Mini.map.removeLayer(Mini.line);
+  Mini.line = traceLayer(3, .85).addTo(Mini.map);
+}
+
+function drawMini() {
+  if (!document.getElementById('miniCam')) return;
+  if (!Mini.map) buildMiniMap();
+  const r = S.data.rows[S.cursor];
+  const { dx, dy } = camOffset(Mini.map, r, 90);
+  document.getElementById('miniCam').style.transform =
+    `rotate(${-r.hdgS}deg) translate(${-dx}px, ${-dy}px)`;
+  document.getElementById('miniN').style.transform = `rotate(${-r.hdgS}deg)`;
+}
+
+/* ---------- video sync ---------- */
+// avitime is milliseconds into the recording, logged per row, so the mapping is exact.
+function videoSpan() {
+  const rows = S.data.rows;
+  return [rows[0].avi / 1000, rows[rows.length - 1].avi / 1000];
+}
+
+function inVideoSpan(vt) {
+  const [s, e] = videoSpan();
+  return vt >= s - 0.5 && vt <= e + 0.5;
+}
+
+function sessionTToVideoTime(t) {
+  const rows = S.data.rows;
+  if (rows[0].avi === null) return null;
+  const r = rows[indexAtTime(t, 0, rows.length - 1)];
+  return r.avi / 1000;
+}
+
+function videoTimeToSessionT(vt) {
+  const rows = S.data.rows;
+  const target = vt * 1000;
+  let lo = 0, hi = rows.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (rows[m].avi < target) lo = m + 1; else hi = m; }
+  return rows[lo].t;
+}
+
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function showNotice(html) {
+  document.getElementById('noticeText').innerHTML = html;
+  document.getElementById('notice').hidden = false;
+}
+
+// Codec support differs sharply between browsers: Safari decodes HEVC, Chrome on
+// macOS generally will not, which is why the same file can play on a phone only.
+function codecSupport() {
+  const v = document.createElement('video');
+  const probe = {
+    'H.264': 'video/mp4; codecs="avc1.42E01E"',
+    'HEVC/H.265': 'video/mp4; codecs="hvc1.1.6.L93.B0"',
+  };
+  return Object.entries(probe)
+    .map(([name, type]) => `${name}: ${v.canPlayType(type) || 'no'}`)
+    .join(', ');
+}
+
+const codecProbe = type => document.createElement('video').canPlayType(type) || 'no';
+
+function paintVideoFrame() {
+  const v = S.video, c = document.getElementById('vcanvas');
+  if (!v || !c || v.readyState < 2 || !v.videoWidth) return;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const s = Math.min(w / v.videoWidth, h / v.videoHeight);
+  const dw = v.videoWidth * s, dh = v.videoHeight * s;
+  ctx.drawImage(v, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  S.vidPainted = true;
+}
+
+function startVideoPaint() {
+  cancelAnimationFrame(S.vidRaf);
+  const step = () => { paintVideoFrame(); S.vidRaf = requestAnimationFrame(step); };
+  step();
+}
+
+function updateVidDiag() {
+  const el = document.getElementById('vdiag'), v = S.video;
+  if (!el || !v) return;
+  let frames = 'n/a', painted = true;
+  if (v.getVideoPlaybackQuality) {
+    const q = v.getVideoPlaybackQuality();
+    frames = `${q.totalVideoFrames} decoded, ${q.droppedVideoFrames} dropped`;
+    painted = q.totalVideoFrames > 0 || S.vidPainted;
+  }
+  frames += S.vidPainted ? ', canvas painting' : ', canvas idle';
+  // Metadata alone is not success: a video can report a size and duration while
+  // never painting a frame, so the readout stays up until one is actually decoded.
+  el.hidden = S.videoReady && !v.error && v.videoWidth > 0 && painted;
+  if (el.hidden) return;
+  el.textContent = [
+    `type ${S.vidType || 'unknown'}`,
+    `readyState ${v.readyState}`,
+    `picture ${v.videoWidth}x${v.videoHeight}`,
+    `box ${v.clientWidth}x${v.clientHeight}`,
+    `duration ${isFinite(v.duration) ? v.duration.toFixed(1) + 's' : 'unknown'}`,
+    v.paused ? 'paused' : 'playing',
+    v.seeking ? 'seeking' : 'idle',
+    `frames ${frames}`,
+    `can play mp4/h264 "${codecProbe('video/mp4; codecs="avc1.42E01E"')}" hevc "${codecProbe('video/mp4; codecs="hvc1.1.6.L93.B0"')}"`,
+    v.error ? `ERROR ${v.error.code}` : 'no error',
+  ].join(' · ');
+}
+
+function reportVideoError(file, v, noPicture) {
+  const why = noPicture
+    ? 'the container loaded but carries no picture this browser can decode'
+    : ({
+        1: 'loading was aborted',
+        2: 'a network error interrupted it',
+        3: 'the browser could not decode it',
+        4: 'this browser has no decoder for its format',
+      }[v.error && v.error.code] || 'it did not load in time');
+  S.videoReady = false; S.videoSync = false;
+  // keep the panel up even on a hard failure, so the diagnostics stay readable
+  document.getElementById('videoWrap').hidden = false;
+  updateVidDiag();
+  document.getElementById('vidName').textContent = 'video not playable here';
+  document.getElementById('vidName').style.color = 'var(--warn)';
+  showNotice(
+    `<b>${esc(file.name)}</b> did not play — ${why}. ` +
+    `This browser reports ${codecSupport()}. ` +
+    `If the file uses a codec listed as unsupported there — H.265/HEVC being the usual one, which Safari and iPhones play but Chrome often will not — ` +
+    `try this page in Safari, or convert it once with ffmpeg: ` +
+    `<code>ffmpeg -i "${esc(file.name)}" -c:v libx264 -crf 20 -pix_fmt yuv420p -c:a aac out.mp4</code> ` +
+    `— the converted file keeps the same timing, so it stays in sync.`);
+}
+
+function loadVideos(files) {
+  if (!files.length) return;
+  files.sort((x, y) => x.name.localeCompare(y.name));
+  const rows = S.data.rows;
+  if (rows[0].avi === null) { alert('This log has no avitime column, so video cannot be synced.'); return; }
+  const v = document.getElementById('video');
+  S.video = v; S.videoReady = false; S.videoSync = false; S.vidPainted = false;
+  cancelAnimationFrame(S.vidRaf);
+  S.vidType = files[0].type || 'unknown';
+  if (S.vidUrl) URL.revokeObjectURL(S.vidUrl);
+  S.vidUrl = URL.createObjectURL(files[0]);
+  v.src = S.vidUrl;
+  v.onloadedmetadata = () => {
+    clearTimeout(S.vidTimer);
+    document.getElementById('videoWrap').hidden = false;
+    updateVidDiag();
+    // Chrome can parse an HEVC container and report a duration while decoding no
+    // picture at all, which shows up only as a zero-sized video track.
+    if (!v.videoWidth || !v.videoHeight) { reportVideoError(files[0], v, true); return; }
+    S.videoReady = true;
+    const [s, e] = videoSpan();
+    // avitime says where in the recording this log sits; a clip that stops short cannot drive the clock
+    S.videoSync = v.duration >= s + 1;
+    const label = document.getElementById('vidName');
+    label.textContent = `${files[0].name} · ${v.duration.toFixed(0)}s`
+      + (files.length > 1 ? ` (+${files.length - 1} more, first shown)` : '')
+      + (S.videoSync
+          ? (v.duration < e - 0.5 ? ` — covers to ${fmtLap(v.duration)}, log needs ${fmtLap(e)}` : ' — synced')
+          : ` — does not overlap this log (log starts at ${fmtLap(s)} of the recording)`);
+    label.style.color = S.videoSync ? 'var(--good)' : 'var(--warn)';
+    v.playbackRate = Play.rate;
+    // Seeking before the first frame exists can leave a large file stuck mid-seek,
+    // painting nothing, so wait until there is decoded data to seek from.
+    if (v.readyState >= 2) seekIndex(S.cursor);
+    else v.addEventListener('loadeddata', () => seekIndex(S.cursor), { once: true });
+    startVideoPaint();
+  };
+  v.onerror = () => reportVideoError(files[0], v);
+  for (const ev of ['loadeddata', 'canplay', 'timeupdate', 'stalled', 'suspend', 'waiting', 'playing', 'seeked', 'pause'])
+    v.addEventListener(ev, updateVidDiag);
+  clearInterval(S.vidPoll);
+  S.vidPoll = setInterval(updateVidDiag, 1000);
+  // some browsers neither load nor fire an error on a codec they half-recognise
+  clearTimeout(S.vidTimer);
+  S.vidTimer = setTimeout(() => { if (!S.videoReady) reportVideoError(files[0], v); }, 10000);
+}
+
+function range() {
+  const rows = S.data.rows;
+  if (S.sel === null) return [0, rows.length - 1];
+  return [S.laps[S.sel].i0, S.laps[S.sel].i1];
+}
+
+function buildStats() {
+  const rows = S.data.rows, [a, b] = range(), seg = rows.slice(a, b + 1);
+  const max = maxOf(seg, r => r.v);
+  const gyMax = maxOf(seg, r => Math.abs(r.gy));
+  const gxMax = maxOf(seg, r => r.gx), gxMin = minOf(seg, r => r.gx);
+  const dur = rows[b].t - rows[a].t, dist = rows[b].d - rows[a].d;
+  const full = S.laps.filter(l => !l.partial);
+  const best = full.length ? minOf(full, l => l.time) : null;
+  const items = [
+    ['Duration', fmtClock(dur)],
+    ['Distance', U.dist(dist).toFixed(2), U.distU()],
+    ['Top speed', U.spd(max).toFixed(1), U.spdU()],
+    ['Avg speed', U.spd(dist / dur * 3.6).toFixed(1), U.spdU()],
+    ['Max lateral', gyMax.toFixed(2), 'g'],
+    ['Max accel', gxMax.toFixed(2), 'g'],
+    ['Max braking', gxMin.toFixed(2), 'g'],
+    ['Laps', String(full.length)],
+    ['Best lap', best === null ? '—' : fmtLap(best)],
+  ];
+  document.getElementById('stats').innerHTML = items.map(([k, v, u]) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v">${v}${u ? `<small>${u}</small>` : ''}</div></div>`).join('');
+}
+
+/* ---------- map ---------- */
+function buildMap() {
+  const rows = S.data.rows;
+  const map = L.map('map', { zoomSnap: 0.25, preferCanvas: true });
+  const osmAttr = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+  const bases = {
+    'Satellite': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 21, maxNativeZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' }),
+    'Street (OSM)': L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: osmAttr }),
+    'Dark': L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      maxZoom: 20, attribution: osmAttr + ' &copy; <a href="https://carto.com/">CARTO</a>' }),
+  };
+  let saved = 'Satellite';
+  try { const v = localStorage.getItem('vbo.base'); if (bases[v]) saved = v; } catch (e) {}
+  bases[saved].addTo(map);
+  L.control.layers(bases, null, { position: 'topright' }).addTo(map);
+  map.on('baselayerchange', e => { try { localStorage.setItem('vbo.base', e.name); } catch (err) {} });
+  S.map = map;
+  drawGate();
+  S.marker = L.circleMarker([rows[0].lat, rows[0].lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#4fc3f7', fillOpacity: 1 }).addTo(map);
+  const legend = L.control({ position: 'bottomleft' });
+  legend.onAdd = () => { S.legendEl = L.DomUtil.create('div', 'legend'); return S.legendEl; };
+  legend.addTo(map);
+  drawLegend();
+  map.on('mousemove', e => {
+    if (!S.data) return;
+    const p = map.latLngToLayerPoint(e.latlng);
+    let best = -1, bd = 12 * 12;
+    const [a, b] = range();
+    for (let i = a; i <= b; i++) {
+      const q = map.latLngToLayerPoint([rows[i].lat, rows[i].lon]);
+      const d = (q.x - p.x) ** 2 + (q.y - p.y) ** 2;
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0) hoverSeek(best);
+  });
+  drawTrack();
+}
+
+function drawLegend() {
+  if (!S.legendEl) return;
+  if (S.colorBy === 'lap' && S.laps.length) {
+    S.legendEl.innerHTML = 'Lap<div class="laps-key">' + S.laps.map(l =>
+      `<span><i data-color="${l.color}"></i>${l.partial ? l.label : 'Lap ' + l.label}</span>`).join('') + '</div>';
+    paintSwatches(S.legendEl);
+    return;
+  }
+  const max = U.spd(maxOf(S.data.rows, r => r.v));
+  S.legendEl.innerHTML = `Speed<div class="bar"></div><div class="ends"><span>0</span><span>${max.toFixed(0)} ${U.spdU()}</span></div>`;
+}
+
+function drawGate() {
+  if (S.gate) { S.map.removeLayer(S.gate); S.gate = null; }
+  if (!S.data.sf) return;
+  S.gate = L.polyline(gateLatLng(S.data.rows, S.data.sf), { color: '#fff', weight: 3, dashArray: '4 4' })
+    .addTo(S.map).bindTooltip('Start / Finish');
+}
+
+function setGateAtCursor() {
+  const rows = S.data.rows, r = rows[S.cursor];
+  S.data.sf = { a: { lat: r.lat, lon: r.lon }, b: { lat: r.lat, lon: r.lon } };
+  S.laps = detectLaps(rows, S.data.sf);
+  assignLapColors();
+  drawGate(); drawLegend(); buildLapTable(); selectLap(null);
+}
+
+function drawTrack() {
+  const rows = S.data.rows, map = S.map;
+  S.layers.forEach(l => map.removeLayer(l)); S.layers = [];
+  const [a, b] = range();
+  const vmax = maxOf(rows, r => r.v) || 1;
+  if (S.sel !== null) {
+    S.layers.push(L.polyline(rows.map(r => [r.lat, r.lon]), { color: '#3a4152', weight: 2, opacity: .6 }).addTo(map));
+  }
+  // dark casing keeps the speed trace readable over satellite imagery
+  S.layers.push(L.polyline(rows.slice(a, b + 1).map(r => [r.lat, r.lon]),
+    { color: '#000', weight: 8, opacity: .45, interactive: false }).addTo(map));
+  const group = [];
+  if (S.colorBy === 'lap' && S.laps.length) {
+    for (const run of lapRuns(a, b)) {
+      group.push(L.polyline(rows.slice(run.i0, run.i1 + 1).map(r => [r.lat, r.lon]),
+        { color: run.color, weight: 4, opacity: .95, interactive: false }));
+    }
+  } else {
+    for (let i = a; i < b; i++) {
+      group.push(L.polyline([[rows[i].lat, rows[i].lon], [rows[i + 1].lat, rows[i + 1].lon]],
+        { color: speedColor(rows[i].v / vmax), weight: 4, opacity: .95, interactive: false }));
+    }
+  }
+  const fg = L.featureGroup(group).addTo(map);
+  S.layers.push(fg);
+  S.marker.bringToFront();
+  map.fitBounds(L.latLngBounds(rows.slice(a, b + 1).map(r => [r.lat, r.lon])), { padding: [24, 24] });
+}
+
+/* ---------- charts ---------- */
+const cursorPlugin = {
+  id: 'cursor',
+  afterDraw(chart) {
+    const i = S.cursor - chart.$base;
+    const meta = chart.getDatasetMeta(0);
+    if (!meta.data[i]) return;
+    const x = meta.data[i].x, { top, bottom } = chart.chartArea, ctx = chart.ctx;
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke(); ctx.restore();
+  }
+};
+
+function mkChart(id, datasets, yTitle, extra = {}) {
+  const c = new Chart(document.getElementById(id), {
+    type: 'line',
+    data: { labels: [], datasets: datasets.map(d => ({ ...d, pointRadius: 0, borderWidth: 1.5, tension: 0 })) },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, parsing: false, normalized: true,
+      interaction: { mode: 'index', intersect: false },
+      onHover: (e, els, chart) => {
+        const pts = chart.getElementsAtEventForMode(e, 'index', { intersect: false }, false);
+        if (pts.length) hoverSeek(chart.$base + pts[0].index, chart);
+      },
+      plugins: { legend: { display: datasets.length > 1, labels: { color: '#8b93a7', boxWidth: 12 } }, tooltip: { enabled: false } },
+      scales: {
+        x: { type: 'linear', ticks: { color: '#8b93a7', maxTicksLimit: 10, callback: v => S.xMode === 'time' ? fmtClock(v) : U.dist(v).toFixed(1) + ' ' + U.distU() },
+             grid: { color: '#262b36' } },
+        y: { title: { display: true, text: '', color: '#8b93a7' }, ticks: { color: '#8b93a7' }, grid: { color: '#262b36' }, ...extra },
+      },
+    },
+    plugins: [cursorPlugin],
+  });
+  c.$base = 0;
+  c.$yTitle = yTitle;
+  return c;
+}
+
+function buildCharts() {
+  S.charts.forEach(c => c.destroy());
+  S.charts = [
+    mkChart('cSpeed', [{ label: 'Speed', borderColor: '#4fc3f7', data: [] }], () => U.spdU()),
+    mkChart('cG', [
+      { label: 'Lateral G', borderColor: '#ffb74d', data: [] },
+      { label: 'Longitudinal G', borderColor: '#66e0a3', data: [] },
+    ], () => 'g'),
+    mkChart('cAlt', [{ label: 'Height', borderColor: '#b17cff', data: [] }], () => U.hgtU()),
+  ];
+  refreshCharts();
+}
+
+function refreshCharts() {
+  const rows = S.data.rows, [a, b] = range();
+  const x0 = S.xMode === 'time' ? rows[a].t : rows[a].d;
+  const X = r => (S.xMode === 'time' ? r.t : r.d) - x0;
+  const seg = rows.slice(a, b + 1);
+  const [cs, cg, ca] = S.charts;
+  cs.data.datasets[0].data = seg.map(r => ({ x: X(r), y: U.spd(r.v) }));
+  cg.data.datasets[0].data = seg.map(r => ({ x: X(r), y: r.gy }));
+  cg.data.datasets[1].data = seg.map(r => ({ x: X(r), y: r.gx }));
+  ca.data.datasets[0].data = seg.map(r => ({ x: X(r), y: U.hgt(r.h) }));
+  for (const c of S.charts) { c.$base = a; c.options.scales.y.title.text = c.$yTitle(); c.update(); }
+  document.getElementById('viewLabel').textContent = S.sel === null ? '· whole session' : `· lap ${S.laps[S.sel].label}`;
+}
+
+/* ---------- laps table ---------- */
+function buildLapTable() {
+  const tb = document.getElementById('lapBody');
+  document.getElementById('thMax').textContent = 'Max ' + U.spdU();
+  document.getElementById('thAvg').textContent = 'Avg ' + U.spdU();
+  if (!S.laps.length) {
+    tb.innerHTML = `<tr><td colspan="6" class="partial">${S.data.sf ? 'No start/finish crossings found' : 'No start/finish line in file'}</td></tr>`;
+    return;
+  }
+  const full = S.laps.filter(l => !l.partial);
+  const best = full.length ? minOf(full, l => l.time) : null;
+  tb.innerHTML = S.laps.map((l, i) => `
+    <tr data-i="${i}" class="${!l.partial && l.time === best ? 'best' : ''}">
+      <td>${S.colorBy === 'lap' ? `<i class="swatch" data-color="${l.color}"></i>` : ''}${l.partial ? l.label + ' lap' : 'Lap ' + l.label}</td>
+      <td class="${l.partial ? 'partial' : ''}">${fmtLap(l.time)}</td>
+      <td class="${l.partial ? 'partial' : ''}">${l.partial || best === null ? '—' : (l.time === best ? '' : '+') + (l.time - best).toFixed(2)}</td>
+      <td>${U.spd(l.max).toFixed(1)}</td><td>${U.spd(l.avg).toFixed(1)}</td><td>${l.maxGy.toFixed(2)}</td>
+    </tr>`).join('');
+  paintSwatches(tb);
+  tb.querySelectorAll('tr').forEach(tr => tr.onclick = () => selectLap(+tr.dataset.i));
+}
+
+function selectLap(i) {
+  Play.pause();
+  S.sel = i;
+  document.querySelectorAll('#lapBody tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i === i));
+  buildStats(); drawTrack(); refreshCharts();
+  if (S.fpv && FPV.map) drawFPVLine();
+  drawMiniLine();
+  setCursor(range()[0]);
+}
+
+/* ---------- cursor / readout ---------- */
+function setCursor(i, src) {
+  S.cursor = i;
+  const r = S.data.rows[i];
+  S.marker.setLatLng([r.lat, r.lon]);
+  for (const c of S.charts) if (c !== src) c.draw();
+  if (src) src.draw();
+  const lap = S.laps.find(l => i >= l.i0 && i <= l.i1);
+  const lapT = lap ? r.t - lap.t0 : r.t;
+  const utc = new Date(r.tod * 1000).toISOString().slice(11, 19);
+  const cells = [
+    ['Speed', U.spd(r.v).toFixed(1) + ' ' + U.spdU()], ['Lateral', r.gy.toFixed(2) + ' g'], ['Longitudinal', r.gx.toFixed(2) + ' g'],
+    ['Heading', r.hdg.toFixed(0) + '°'], ['Height', U.hgt(r.h).toFixed(0) + ' ' + U.hgtU()],
+    ['Lap time', (lap ? lap.label + ' · ' : '') + fmtLap(Math.max(0, lapT))],
+    ['Session', fmtClock(r.t)], ['UTC', utc], ['Sats', String(r.sats)],
+  ];
+  if (r.avi !== null) cells.push(['Video', fmtClock(r.avi / 1000)]);
+  document.getElementById('readout').innerHTML = cells.map(([k, v]) => `<div>${k}<b>${v}</b></div>`).join('');
+  drawGG();
+  drawMini();
+  drawFPV();
+
+  const [a, b] = range();
+  const scrub = document.getElementById('scrub');
+  if (scrub) {
+    scrub.min = a; scrub.max = b; scrub.value = i;
+    document.getElementById('tcode').textContent = fmtLap(Math.max(0, lapT));
+  }
+  const hs = document.getElementById('vhudSpeed');
+  if (hs && !document.getElementById('videoWrap').hidden) {
+    hs.textContent = U.spd(r.v).toFixed(0) + ' ' + U.spdU();
+    document.getElementById('vhudG').textContent = Math.hypot(r.gx, r.gy).toFixed(2) + ' g';
+  }
+}
+
+/* ---------- G-G friction circle ---------- */
+function drawGG() {
+  const cv = document.getElementById('gg');
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1, size = 200;
+  if (cv.width !== size * dpr) { cv.width = cv.height = size * dpr; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size, size);
+  const c = size / 2, maxG = 1.5, R = c - 14, k = R / maxG;
+  const px = r => [c + r.gy * k, c - r.gx * k];
+
+  ctx.strokeStyle = '#262b36'; ctx.lineWidth = 1;
+  for (const g of [0.5, 1, 1.5]) { ctx.beginPath(); ctx.arc(c, c, g * k, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(c - R, c); ctx.lineTo(c + R, c); ctx.moveTo(c, c - R); ctx.lineTo(c, c + R); ctx.stroke();
+  ctx.fillStyle = '#8b93a7'; ctx.font = '9px system-ui, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('accel', c, 9); ctx.fillText('brake', c, size - 3);
+  ctx.textAlign = 'left'; ctx.fillText('R', c + R + 2, c + 3);
+  ctx.textAlign = 'right'; ctx.fillText('L', c - R - 2, c + 3);
+  ctx.textAlign = 'left';
+  for (const g of [0.5, 1, 1.5]) ctx.fillText(g + 'g', c + g * k * 0.7071 + 2, c + g * k * 0.7071 + 9);
+
+  const [a, b] = range();
+  const rows = S.data.rows;
+  ctx.fillStyle = 'rgba(79,195,247,.28)';
+  for (let i = a; i <= b; i++) { const [x, y] = px(rows[i]); ctx.fillRect(x - 1, y - 1, 2, 2); }
+
+  const r = rows[S.cursor], [x, y] = px(r);
+  ctx.strokeStyle = '#ffb74d'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(x, y); ctx.stroke();
+  ctx.fillStyle = '#ffb74d'; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = '#e6e8ee'; ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(Math.hypot(r.gx, r.gy).toFixed(2) + ' g', 4, size - 4);
+}
+
+/* ---------- loading ---------- */
+function loadText(text, name) {
+  try { build(parseVBO(text), name); }
+  catch (e) { alert('Could not read file: ' + e.message); console.error(e); }
+}
+function loadFile(f) { f.text().then(t => loadText(t, f.name)); }
+
+window.addEventListener('keydown', e => {
+  if (!S.data || /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return;
+  const [a, b] = range();
+  if (e.code === 'Space') { e.preventDefault(); Play.toggle(); }
+  else if (e.code === 'ArrowRight') { Play.pause(); seekIndex(S.cursor + (e.shiftKey ? 10 : 1)); }
+  else if (e.code === 'ArrowLeft') { Play.pause(); seekIndex(S.cursor - (e.shiftKey ? 10 : 1)); }
+  else if (e.code === 'Home') { Play.pause(); seekIndex(a); }
+  else if (e.code === 'End') { Play.pause(); seekIndex(b); }
+});
+
+document.querySelectorAll('#units button').forEach(b => b.onclick = () => setUnits(b.dataset.u));
+setUnits(S.units);
+
+document.getElementById('noticeX').onclick = () => { document.getElementById('notice').hidden = true; };
+document.getElementById('file').onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
+document.getElementById('vidFile').onchange = e => {
+  if (!S.data) { alert('Open a .vbo log first — the video syncs to its data.'); e.target.value = ''; return; }
+  loadVideos([...e.target.files]);
+};
+document.getElementById('sample').onclick = () =>
+  fetch('sample/DR_15290001.vbo').then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); })
+    .then(t => loadText(t, 'DR_15290001.vbo'))
+    .catch(e => alert('Sample not available: ' + e.message));
+
+const drop = document.getElementById('drop');
+let dragDepth = 0;
+window.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; drop.classList.add('on'); });
+window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('on'); } });
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; drop.classList.remove('on');
+  const f = e.dataTransfer.files[0]; if (f) loadFile(f);
+});

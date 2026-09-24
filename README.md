@@ -41,4 +41,34 @@ Unresolved. Anyone picking this up should start from `chrome://media-internals` 
 
 `.vbo` files are plain text. Latitude and longitude are stored in **minutes**, with positive longitude meaning **West**. Time is UTC `HHMMSS.ss`. The `[laptiming]` line gives two points; this viewer anchors the gate at their midpoint and lays it across the track, 50 m wide, perpendicular to the direction of travel at that spot.
 
-Leaflet and Chart.js are vendored in `vendor/` so the page works offline; map tiles come from CARTO/OpenStreetMap when online.
+Leaflet 1.9.4 and Chart.js 4.5.1 are vendored in `vendor/` so the page works offline and no third-party CDN can change the code it runs; map tiles come from Esri, OpenStreetMap and CARTO when online.
+
+## Security
+
+Files you open are parsed in the browser and never uploaded. Because a `.vbo` is untrusted input, the app is built so that content from a file cannot become code:
+
+- **Content-Security-Policy** (`index.html`): scripts and styles load only from the app's own origin, with no inline script, no inline styles and no `eval`. Images are allowed from the three tile servers, video only from files you pick. Nothing from a parsed file is written into the page as markup, and the policy is the backstop if that ever changes.
+- **Android** (`android/`): the app is served from `https://appassets.androidplatform.net` through `WebViewAssetLoader` rather than `file://`, so WebView file access is switched off. The WebView never navigates away from the app; links such as the map attribution open in your browser instead. Backups are disabled, and a crashed renderer restarts the screen instead of the whole app.
+- **Build pipeline** (`.github/workflows/android.yml`): runs no third-party actions. The build job has read-only access; only a separate publish step, which runs nothing but the GitHub CLI, can write to the repository. The Gradle distribution is pinned to its SHA-256.
+
+### One-time setup: a stable signing key for the APK
+
+Android installs an update only if it is signed with the same key as the installed copy. Without the secrets below, each CI build signs with a new throwaway key, so every update needs an uninstall first, which also wipes the app's saved settings.
+
+1. Create a keystore once, on a machine with a JDK, and keep it somewhere safe. Losing it means users must uninstall to take future updates.
+
+   ```
+   keytool -genkeypair -v -keystore vbo-release.jks -alias vbo -keyalg RSA -keysize 4096 -validity 10000
+   base64 -i vbo-release.jks | tr -d '\n' > vbo-release.b64
+   ```
+
+2. In the repository's **Settings → Secrets and variables → Actions**, add:
+
+   | Secret | Value |
+   |---|---|
+   | `SIGNING_KEYSTORE_BASE64` | contents of `vbo-release.b64` |
+   | `SIGNING_STORE_PASSWORD` | the keystore password |
+   | `SIGNING_KEY_ALIAS` | `vbo` |
+   | `SIGNING_KEY_PASSWORD` | the key password (the same as the keystore password unless you set a separate one) |
+
+3. Re-run the **Build APK** workflow. Uninstall the current app one last time and install the new APK; every later build installs over it as a normal update.
